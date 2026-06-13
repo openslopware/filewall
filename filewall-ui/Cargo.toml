@@ -1,0 +1,14 @@
+[package]
+name = "filewall-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "filewall-ui"
+path = "src/main.rs"
+
+[dependencies]
+filewall-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
