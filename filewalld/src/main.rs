@@ -20,7 +20,7 @@ use std::time::Duration;
 const DEFAULT_CONFIG: &str = "/etc/filewall/config.toml";
 const PIDFILE: &str = "/run/filewall/filewalld.pid";
 
-static RELOAD: AtomicBool = AtomicBool::new(false);
+pub(crate) static RELOAD: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sighup(_sig: libc::c_int) {
     RELOAD.store(true, Ordering::SeqCst);
