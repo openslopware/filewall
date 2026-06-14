@@ -59,6 +59,9 @@ pub struct WatchPolicy {
     learn_object: ObjectKind,
     /// Whether learned rules from this watch pin the process cwd.
     learn_cwd: bool,
+    /// Globs (matched against absolute paths) of sub-paths to skip when marking.
+    /// A matching directory prunes its whole subtree; a matching file is skipped.
+    exclude: GlobSet,
 }
 
 impl WatchPolicy {
@@ -70,11 +73,17 @@ impl WatchPolicy {
         default_action: Action,
         learn_object: ObjectKind,
         learn_cwd: bool,
+        exclude_patterns: &[String],
     ) -> Result<Self, globset::Error> {
         let mut builder = GlobSetBuilder::new();
         for pat in allow_patterns {
             let glob: Glob = GlobBuilder::new(pat).literal_separator(true).build()?;
             builder.add(glob);
+        }
+        let mut exclude = GlobSetBuilder::new();
+        for pat in exclude_patterns {
+            let glob: Glob = GlobBuilder::new(pat).literal_separator(true).build()?;
+            exclude.add(glob);
         }
         Ok(Self {
             root: root.into(),
@@ -82,6 +91,7 @@ impl WatchPolicy {
             default_action,
             learn_object,
             learn_cwd,
+            exclude: exclude.build()?,
         })
     }
 
@@ -115,6 +125,12 @@ impl WatchPolicy {
     /// Does this policy govern accesses to `path`?
     pub fn covers(&self, path: &Path) -> bool {
         path.starts_with(&self.root)
+    }
+
+    /// True if `path` matches one of this watch's exclude globs, so it (and, for
+    /// a directory, its whole subtree) should be left unmarked.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        self.exclude.is_match(path)
     }
 
     /// Decide the outcome for a process whose executable is `exe`.
@@ -174,6 +190,7 @@ mod tests {
             Action::Prompt,
             ObjectKind::File,
             false,
+            &[],
         )
         .unwrap()
     }
@@ -195,7 +212,7 @@ mod tests {
 
     #[test]
     fn learned_rule_tree_uses_watch_root() {
-        let p = WatchPolicy::new("/home/u/.ssh", &[], Action::Prompt, ObjectKind::Tree, false).unwrap();
+        let p = WatchPolicy::new("/home/u/.ssh", &[], Action::Prompt, ObjectKind::Tree, false, &[]).unwrap();
         let r = p.learned_rule(
             RuleAction::Allow,
             "/usr/bin/node",
@@ -210,7 +227,7 @@ mod tests {
 
     #[test]
     fn learned_rule_file_uses_exact_path_and_cwd() {
-        let p = WatchPolicy::new("/home/u/.ssh", &[], Action::Prompt, ObjectKind::File, true).unwrap();
+        let p = WatchPolicy::new("/home/u/.ssh", &[], Action::Prompt, ObjectKind::File, true, &[]).unwrap();
         let r = p.learned_rule(
             RuleAction::Deny,
             "/usr/bin/node",
@@ -257,6 +274,7 @@ mod tests {
             Action::Prompt,
             ObjectKind::File,
             false,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -267,7 +285,7 @@ mod tests {
 
     #[test]
     fn default_action_deny_is_honored() {
-        let p = WatchPolicy::new("/x", &["/usr/bin/ssh".to_string()], Action::Deny, ObjectKind::File, false).unwrap();
+        let p = WatchPolicy::new("/x", &["/usr/bin/ssh".to_string()], Action::Deny, ObjectKind::File, false, &[]).unwrap();
         assert_eq!(p.evaluate("/usr/bin/node"), Outcome::Deny);
     }
 
@@ -279,10 +297,33 @@ mod tests {
     }
 
     #[test]
+    fn exclude_globs_prune_paths() {
+        let p = WatchPolicy::new(
+            "/home/u/.config",
+            &[],
+            Action::Prompt,
+            ObjectKind::File,
+            false,
+            &["**/Cache".to_string(), "**/*.tmp".to_string()],
+        )
+        .unwrap();
+        // A matching directory (subtree gets pruned by the walker).
+        assert!(p.is_excluded(Path::new("/home/u/.config/app/Cache")));
+        // A matching file anywhere in the tree.
+        assert!(p.is_excluded(Path::new("/home/u/.config/x/y.tmp")));
+        // Non-matching paths are kept.
+        assert!(!p.is_excluded(Path::new("/home/u/.config/keep.txt")));
+        // No exclude patterns -> nothing is excluded.
+        let none =
+            WatchPolicy::new("/x", &[], Action::Prompt, ObjectKind::File, false, &[]).unwrap();
+        assert!(!none.is_excluded(Path::new("/x/anything/Cache")));
+    }
+
+    #[test]
     fn policy_routes_to_covering_watch() {
-        let ssh = WatchPolicy::new("/home/user/.ssh", &["/usr/bin/ssh".to_string()], Action::Prompt, ObjectKind::File, false)
+        let ssh = WatchPolicy::new("/home/user/.ssh", &["/usr/bin/ssh".to_string()], Action::Prompt, ObjectKind::File, false, &[])
             .unwrap();
-        let aws = WatchPolicy::new("/home/user/.aws", &["/usr/bin/aws".to_string()], Action::Prompt, ObjectKind::File, false)
+        let aws = WatchPolicy::new("/home/user/.aws", &["/usr/bin/aws".to_string()], Action::Prompt, ObjectKind::File, false, &[])
             .unwrap();
         let policy = Policy::new(vec![ssh, aws]);
 

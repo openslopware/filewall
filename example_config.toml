@@ -1,0 +1,119 @@
+# filewall — example configuration
+#
+# This file documents every option filewalld understands and shows a few
+# different ways to guard sensitive files. Copy it to /etc/filewall/config.toml
+# (the default path) or pass a path as the first argument to `filewalld`.
+#
+# filewalld marks each existing file under every [[watch]] root with a fanotify
+# open-permission event. When a process opens one of those files, the daemon
+# decides — from this config plus any *learned* rules — whether to allow, deny,
+# or prompt the user via the filewall-ui helper.
+#
+# Hot reload: editing this file (or sending SIGHUP via `filewallctl reload`)
+# re-reads the config and re-marks files within ~half a second. No restart.
+
+# ─── Global settings ────────────────────────────────────────────────────────
+
+# What to do when an access is NOT matched by a watch's `allow` list.
+#   "prompt" — ask the user (default)
+#   "allow"  — permit silently (audit-only: pair with learned deny rules)
+#   "deny"   — refuse silently (lockdown: only `allow`-listed exes get through)
+default_action = "prompt"
+
+# How long to wait for the user to answer a prompt before failing closed (deny).
+# A generous timeout avoids spurious denials when you step away mid-decision.
+prompt_timeout_seconds = 120
+
+# Unix socket the daemon binds and the filewall-ui helper connects to.
+socket_path = "/run/filewall/prompt.sock"
+
+# Where "Always allow/deny" decisions are persisted (learned rules). The daemon
+# reloads this on the same trigger as the config.
+rules_path = "/var/lib/filewall/rules.toml"
+
+
+# ─── Watch blocks ───────────────────────────────────────────────────────────
+#
+# Each [[watch]] guards one directory tree (or a single file). Fields:
+#
+#   path          Required. The root to guard. A leading `~` expands to $HOME.
+#                 Symlinked roots are canonicalized so they still match.
+#
+#   allow         Globs matched against the accessing process's *executable*
+#                 path (e.g. /usr/bin/ssh). A match → allow without prompting.
+#                 Glob rules: `*` does NOT cross `/`, `**` does. Empty = nothing
+#                 is pre-allowed (every access goes to `default_action`).
+#
+#   exclude       Globs matched against absolute *file* paths under `path`.
+#                 A matching directory prunes its whole subtree (never marked or
+#                 traversed); a matching file is skipped. Use this to keep noisy,
+#                 non-sensitive trees (browser caches, etc.) from exhausting the
+#                 kernel's fanotify mark limit (fs.fanotify.max_user_marks).
+#                 Same glob rules as `allow`.
+#
+#   learn_object  What an "Always" decision records: "file" (this exact path,
+#                 default) or "tree" (the whole watch root). Use "tree" for
+#                 sprawling app-config dirs where per-file rules are unmanageable.
+#
+#   learn_match   Subset of ["exe", "cwd"]. "cwd" pins a learned rule to the
+#                 working directory the process was launched from — tighter, but
+#                 the rule only applies when launched from that same cwd.
+
+
+# Approach 1 — Allowlist a known toolchain, prompt on anything else.
+# The common case: SSH keys that ssh/git legitimately read; anyone else asks.
+[[watch]]
+path = "~/.ssh"
+allow = ["/usr/bin/ssh", "/usr/bin/ssh-*", "/usr/bin/git"]
+learn_object = "file"
+learn_match = ["exe"]
+
+
+# Approach 2 — Lock down a single secret file with NO allowlist.
+# Every reader is prompted (or denied, per default_action). Good for tokens.
+[[watch]]
+path = "~/.vault-token"
+allow = []
+learn_object = "file"
+learn_match = ["exe"]
+
+
+# Approach 3 — Tree-mode learning for a sprawling app directory.
+# Browser/Electron config dirs hold thousands of files; record decisions at the
+# tree level, and `exclude` the cache subtrees so we don't waste fanotify marks
+# on disposable data.
+[[watch]]
+path = "~/.config/Ferdium"
+allow = []
+exclude = [
+    "**/Cache",
+    "**/Cache_Data",
+    "**/Code Cache",
+    "**/GPUCache",
+    "**/Service Worker/CacheStorage",
+]
+learn_object = "tree"
+learn_match = ["exe"]
+
+
+# Approach 4 — cwd-pinned rules for a dev secret.
+# `learn_match = ["exe", "cwd"]` means an "Always allow" only applies when the
+# same binary is run from the same project directory — so `node` reading your
+# AWS creds is remembered for *this* project, not globally.
+[[watch]]
+path = "~/.aws"
+allow = ["/usr/bin/aws"]
+learn_object = "file"
+learn_match = ["exe", "cwd"]
+
+
+# Approach 5 — Strict deny-by-default for a high-value directory.
+# With default_action = "prompt" globally, set an explicit lockdown here by
+# leaving `allow` empty and relying on learned deny rules; or run the whole
+# daemon with default_action = "deny" for a fail-closed posture.
+[[watch]]
+path = "~/.gnupg"
+allow = ["/usr/bin/gpg", "/usr/bin/gpg-agent"]
+exclude = ["**/*.lock", "**/random_seed"]
+learn_object = "tree"
+learn_match = ["exe"]

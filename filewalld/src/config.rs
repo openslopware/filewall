@@ -8,6 +8,7 @@
 //! [[watch]]
 //! path = "/home/user/.ssh"
 //! allow = ["/usr/bin/ssh", "/usr/bin/ssh-*"]
+//! exclude = ["**/Cache", "**/Cache_Data"]  # subtrees to leave unmarked
 //! ```
 
 use crate::policy::{Action, Policy, WatchPolicy};
@@ -34,6 +35,13 @@ pub struct WatchConfig {
     pub path: String,
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Glob patterns (matched against absolute paths) of sub-paths to skip when
+    /// marking. A matching directory prunes its whole subtree — use this to keep
+    /// noisy, non-sensitive trees (e.g. browser caches) from exhausting the
+    /// kernel's fanotify mark limit. Globs follow the same rules as `allow`
+    /// (`*` does not cross `/`, `**` does).
+    #[serde(default)]
+    pub exclude: Vec<String>,
     /// "file" | "tree" — what an "Always" decision records. Default: file.
     #[serde(default = "default_learn_object")]
     pub learn_object: ObjectKind,
@@ -86,8 +94,15 @@ impl Config {
         for w in &self.watch {
             let root = canonicalize_root(expand_home(&w.path));
             let learn_cwd = w.learn_match.iter().any(|m| m == "cwd");
-            let wp = WatchPolicy::new(root, &w.allow, self.default_action, w.learn_object, learn_cwd)
-                .map_err(|e| ConfigError::Glob(w.path.clone(), e))?;
+            let wp = WatchPolicy::new(
+                root,
+                &w.allow,
+                self.default_action,
+                w.learn_object,
+                learn_cwd,
+                &w.exclude,
+            )
+            .map_err(|e| ConfigError::Glob(w.path.clone(), e))?;
             watches.push(wp);
         }
         Ok(Policy::new(watches))
@@ -247,6 +262,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exclude_defaults_and_parses() {
+        let cfg = Config::from_str(
+            r#"
+            [[watch]]
+            path = "/a"
+            [[watch]]
+            path = "/b"
+            exclude = ["**/Cache", "**/Cache_Data"]
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.watch[0].exclude.is_empty());
+        assert_eq!(cfg.watch[1].exclude, vec!["**/Cache", "**/Cache_Data"]);
+        // An invalid exclude glob is surfaced as a build error.
+        let bad = Config::from_str(
+            r#"
+            [[watch]]
+            path = "/x"
+            exclude = ["[invalid"]
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(bad.build_policy(), Err(ConfigError::Glob(_, _))));
     }
 
     #[test]

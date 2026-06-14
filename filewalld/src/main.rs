@@ -13,7 +13,7 @@ use fanotify::Fanotify;
 use filewall_proto::{Decision, PromptRequest};
 use filewall_rules::{RuleAction, Rules};
 use log::{debug, info, warn};
-use policy::{combine, Outcome, Policy};
+use policy::{combine, Outcome, Policy, WatchPolicy};
 use server::{is_disconnect, UiLink, UiServer};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,17 +106,65 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
 }
 
-/// Mark every existing regular file under each watched root. Idempotent
-/// (FAN_MARK_ADD on an already-marked inode is a no-op).
+/// What a watch root resolved to on disk at mark time. Drives both what gets
+/// marked and the per-watch log line.
+#[derive(Debug)]
+enum WatchScan {
+    /// Path missing, or neither a regular file nor a directory.
+    Unresolved,
+    /// A single regular file: mark just this one inode.
+    File(PathBuf),
+    /// A directory tree (possibly empty): mark each contained file.
+    Dir(Vec<PathBuf>),
+}
+
+/// Resolve a watch root once and classify it for marking + reporting. The root
+/// is already canonicalized by the config loader, so `symlink_metadata` reflects
+/// the real target type. `exclude` does not apply to a single-file watch (there
+/// is no subtree to prune), only to directory recursion.
+fn scan_watch(watch: &WatchPolicy) -> WatchScan {
+    let root = watch.root();
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if m.is_file() => WatchScan::File(root.to_path_buf()),
+        Ok(m) if m.is_dir() => WatchScan::Dir(walk_files(root, |p| watch.is_excluded(p))),
+        _ => WatchScan::Unresolved,
+    }
+}
+
+/// Mark every guarded file. A watch root may be a single regular file (mark that
+/// inode) or a directory (mark every file under it, minus excludes). Idempotent
+/// (FAN_MARK_ADD on an already-marked inode is a no-op). Logs a per-watch
+/// summary, and warns loudly when a watch resolves to nothing markable so a
+/// misconfigured guard is never silent.
 fn mark_all(fan: &Fanotify, policy: &Policy) -> usize {
     let mut marked = 0usize;
     for watch in policy.watches() {
-        for file in walk_files(watch.root()) {
-            match fan.mark_file(&file) {
-                Ok(()) => marked += 1,
+        let root = watch.root();
+        let files = match scan_watch(watch) {
+            WatchScan::File(p) => vec![p],
+            WatchScan::Dir(files) => files,
+            WatchScan::Unresolved => {
+                if root.exists() {
+                    warn!("watch {}: not a regular file or directory; nothing marked", root.display());
+                } else {
+                    warn!("watch {}: path does not exist; nothing marked", root.display());
+                }
+                continue;
+            }
+        };
+        if files.is_empty() {
+            warn!("watch {}: no markable files (empty)", root.display());
+            continue;
+        }
+        let mut n = 0usize;
+        for file in &files {
+            match fan.mark_file(file) {
+                Ok(()) => n += 1,
                 Err(e) => warn!("could not mark {}: {e}", file.display()),
             }
         }
+        info!("watch {}: marked {n} file(s)", root.display());
+        marked += n;
     }
     marked
 }
@@ -267,8 +315,11 @@ fn always_action(d: Decision) -> Option<RuleAction> {
     }
 }
 
-/// Recursively collect regular files under `root` (skipping symlinks).
-fn walk_files(root: &Path) -> Vec<PathBuf> {
+/// Recursively collect regular files under `root` (skipping symlinks). Any path
+/// for which `is_excluded` returns true is skipped; if it's a directory, its
+/// whole subtree is pruned (never descended), which is what keeps noisy trees
+/// from exhausting the kernel's fanotify mark limit.
+fn walk_files(root: &Path, is_excluded: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -278,6 +329,9 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if is_excluded(&path) {
+                continue; // pruned: excluded dir subtree, or excluded file
+            }
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -295,7 +349,105 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_pidfile;
+    use super::{scan_watch, walk_files, write_pidfile, WatchScan};
+    use crate::policy::{Action, WatchPolicy};
+    use filewall_rules::ObjectKind;
+    use std::path::{Path, PathBuf};
+
+    fn unique_tmp(tag: &str) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        std::env::temp_dir().join(format!(
+            "filewall-{tag}-{}-{}-{}",
+            std::process::id(),
+            ts.as_secs(),
+            ts.subsec_nanos()
+        ))
+    }
+
+    fn watch_for(root: &Path, exclude: &[String]) -> WatchPolicy {
+        WatchPolicy::new(root, &[], Action::Prompt, ObjectKind::File, false, exclude).unwrap()
+    }
+
+    #[test]
+    fn scan_watch_classifies_file_dir_and_missing() {
+        let base = unique_tmp("scan");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Missing path -> Unresolved.
+        let missing = base.join("nope");
+        assert!(matches!(
+            scan_watch(&watch_for(&missing, &[])),
+            WatchScan::Unresolved
+        ));
+
+        // Single regular file -> File(that path).
+        let file = base.join("token");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(
+            scan_watch(&watch_for(&file, &[])),
+            WatchScan::File(p) if p == file
+        ));
+
+        // Directory with files, with an excluded subtree pruned -> Dir(set).
+        let dir = base.join("tree");
+        std::fs::create_dir_all(dir.join("Cache")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("Cache/junk"), b"x").unwrap();
+        match scan_watch(&watch_for(&dir, &["**/Cache".to_string()])) {
+            WatchScan::Dir(files) => {
+                assert!(files.contains(&dir.join("a.txt")));
+                assert!(!files.iter().any(|f| f.starts_with(dir.join("Cache"))));
+            }
+            other => panic!("expected Dir, got {other:?}"),
+        }
+
+        // Empty directory -> Dir(empty).
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(
+            scan_watch(&watch_for(&empty, &[])),
+            WatchScan::Dir(ref f) if f.is_empty()
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn walk_files_prunes_excluded_dirs_and_files() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "filewall-walk-{}-{}-{}",
+            std::process::id(),
+            ts.as_secs(),
+            ts.subsec_nanos()
+        ));
+        // root/keep.txt, root/note.tmp, root/Cache/junk, root/sub/keep2.txt
+        std::fs::create_dir_all(root.join("Cache")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("keep.txt"), b"x").unwrap();
+        std::fs::write(root.join("note.tmp"), b"x").unwrap();
+        std::fs::write(root.join("Cache/junk"), b"x").unwrap();
+        std::fs::write(root.join("sub/keep2.txt"), b"x").unwrap();
+
+        // Exclude the Cache subtree and any .tmp file.
+        let files = walk_files(&root, |p| {
+            let s = p.to_string_lossy();
+            s.ends_with(".tmp") || s.ends_with("/Cache")
+        });
+
+        let names: std::collections::HashSet<PathBuf> = files.into_iter().collect();
+        assert!(names.contains(&root.join("keep.txt")));
+        assert!(names.contains(&root.join("sub/keep2.txt")));
+        // Pruned: the excluded file and everything under the excluded dir.
+        assert!(!names.contains(&root.join("note.tmp")));
+        assert!(!names.contains(&root.join("Cache/junk")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn pidfile_write_has_trailing_newline() {
