@@ -84,7 +84,7 @@ impl Config {
     pub fn build_policy(&self) -> Result<Policy, ConfigError> {
         let mut watches = Vec::new();
         for w in &self.watch {
-            let root = expand_home(&w.path);
+            let root = canonicalize_root(expand_home(&w.path));
             let learn_cwd = w.learn_match.iter().any(|m| m == "cwd");
             let wp = WatchPolicy::new(root, &w.allow, self.default_action, w.learn_object, learn_cwd)
                 .map_err(|e| ConfigError::Glob(w.path.clone(), e))?;
@@ -92,6 +92,18 @@ impl Config {
         }
         Ok(Policy::new(watches))
     }
+}
+
+/// Resolve a watch root to its canonical form so it matches the fully-resolved
+/// paths the kernel reports for accesses (via `/proc/self/fd/N`). Without this,
+/// a watch configured on a symlinked directory never `covers()` the canonical
+/// accessed path, so every access falls through to the allow default.
+///
+/// If canonicalization fails (e.g. the path doesn't exist yet), keep the
+/// expanded path so config loading stays non-fatal; nothing under a missing
+/// path can be marked or accessed anyway.
+fn canonicalize_root(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 /// Expand a leading `~` or `~/...` to `$HOME`. Other paths pass through.
@@ -191,6 +203,50 @@ mod tests {
         // explicit
         assert_eq!(cfg.watch[1].learn_object, filewall_rules::ObjectKind::Tree);
         assert!(cfg.watch[1].learn_match.iter().any(|m| m == "cwd"));
+    }
+
+    #[test]
+    fn watch_on_symlinked_dir_still_covers_canonical_access() {
+        // Regression: a watch configured on a symlinked directory must still
+        // govern accesses, which the kernel reports via their canonical path.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "filewall-symlink-{}-{}-{}",
+            std::process::id(),
+            ts.as_secs(),
+            ts.subsec_nanos()
+        ));
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let cfg = Config::from_str(&format!(
+            r#"
+            [[watch]]
+            path = "{}"
+            allow = ["/usr/bin/ssh"]
+            "#,
+            link.display()
+        ))
+        .unwrap();
+        let policy = cfg.build_policy().unwrap();
+
+        // The kernel reports the canonical path for an access; policy must cover it.
+        let canonical_file = std::fs::canonicalize(&real).unwrap().join("secret");
+        assert_eq!(
+            policy.evaluate(&canonical_file, "/usr/bin/node"),
+            Outcome::Prompt,
+            "symlinked watch must prompt for a non-allowed exe, not fall through to allow"
+        );
+        assert_eq!(
+            policy.evaluate(&canonical_file, "/usr/bin/ssh"),
+            Outcome::Allow
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
