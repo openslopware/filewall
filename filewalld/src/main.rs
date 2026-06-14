@@ -12,6 +12,7 @@ use config::Config;
 use fanotify::Fanotify;
 use filewall_proto::{Decision, PromptRequest};
 use filewall_rules::{RuleAction, Rules};
+use log::{debug, info, warn};
 use policy::{combine, Outcome, Policy};
 use server::{is_disconnect, UiLink, UiServer};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,13 @@ fn write_pidfile(path: &Path, pid: u32) -> std::io::Result<()> {
 }
 
 fn main() {
+    // Default to `info`; `RUST_LOG=debug` surfaces per-access allow decisions.
+    // Logs go to stderr, which journald captures under the unit.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    )
+    .init();
+
     if let Err(e) = run() {
         eprintln!("filewalld: fatal: {e}");
         std::process::exit(1);
@@ -55,12 +63,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     watcher::spawn_watcher(Path::new(&config_path), &rules_path);
     let mut rules = Rules::load(&rules_path);
 
-    log(&format!("loaded config from {config_path}"));
-    log(&format!(
+    info!("loaded config from {config_path}");
+    info!(
         "loaded {} learned rule(s) from {}",
         rules.rules.len(),
         rules_path.display()
-    ));
+    );
 
     // Init the fanotify group first (fails fast with EPERM if not root).
     let fan = Fanotify::init().map_err(|e| {
@@ -74,27 +82,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pidfile = PathBuf::from(PIDFILE);
     if let Err(e) = write_pidfile(&pidfile, own_pid) {
-        log(&format!(
-            "warning: could not write pidfile {}: {e}",
-            pidfile.display()
-        ));
+        warn!("could not write pidfile {}: {e}", pidfile.display());
     }
 
     // Bind and wait for the UI helper BEFORE marking files, so there is never a
     // window where marks exist but no one can answer prompts.
     let server = UiServer::bind(&cfg.socket_path, timeout)?;
-    log(&format!(
+    info!(
         "listening on {}; waiting for filewall-ui to connect...",
         cfg.socket_path.display()
-    ));
+    );
     // Block for the first UI at startup; thereafter the link is recovered
     // non-blockingly in the event loop, so it is held as an Option.
     let mut ui = Some(server.accept()?);
-    log("UI helper connected");
+    info!("UI helper connected");
 
     // Now mark every existing file under each watched root.
     let marked = mark_all(&fan, &policy);
-    log(&format!("marked {marked} file(s); entering event loop"));
+    info!("marked {marked} file(s); entering event loop");
 
     event_loop(
         &fan, &mut policy, &mut rules, &rules_path, &config_path, &server, &mut ui, own_pid,
@@ -109,7 +114,7 @@ fn mark_all(fan: &Fanotify, policy: &Policy) -> usize {
         for file in walk_files(watch.root()) {
             match fan.mark_file(&file) {
                 Ok(()) => marked += 1,
-                Err(e) => log(&format!("warning: could not mark {}: {e}", file.display())),
+                Err(e) => warn!("could not mark {}: {e}", file.display()),
             }
         }
     }
@@ -136,20 +141,21 @@ fn event_loop(
         };
 
         if RELOAD.swap(false, Ordering::SeqCst) {
+            info!("reload requested; reloading config from {config_path}");
             match Config::load(Path::new(config_path)) {
                 Ok(new_cfg) => match new_cfg.build_policy() {
                     Ok(new_policy) => {
                         *policy = new_policy;
                         *rules = Rules::load(rules_path);
                         let n = mark_all(fan, policy);
-                        log(&format!(
+                        info!(
                             "reloaded config + {} rule(s); re-marked {n} file(s)",
                             rules.rules.len()
-                        ));
+                        );
                     }
-                    Err(e) => log(&format!("reload failed (policy): {e}; keeping current config")),
+                    Err(e) => warn!("reload failed (policy): {e}; keeping current config"),
                 },
-                Err(e) => log(&format!("reload failed (config): {e}; keeping current config")),
+                Err(e) => warn!("reload failed (config): {e}; keeping current config"),
             }
         }
 
@@ -164,7 +170,7 @@ fn event_loop(
             // The held pidfd is what makes exe()/cmdline() race-free; warn if the
             // kernel didn't deliver one (then resolution is best-effort).
             if !ev.has_pidfd() {
-                log(&format!("warning: no pidfd for pid {}; exe may be racy", ev.pid));
+                warn!("no pidfd for pid {}; exe may be racy", ev.pid);
             }
             let exe = ev.exe();
             let cwd = ev.cwd();
@@ -187,10 +193,10 @@ fn event_loop(
                         match server.try_accept() {
                             Ok(Some(link)) => {
                                 *ui = Some(link);
-                                log("UI reconnected");
+                                info!("UI reconnected");
                             }
                             Ok(None) => {}
-                            Err(e) => log(&format!("warning: try_accept failed: {e}")),
+                            Err(e) => warn!("try_accept failed: {e}"),
                         }
                     }
                     // Borrow ends with the result; lets us reassign `ui` below.
@@ -206,14 +212,9 @@ fn event_loop(
                                         watch.learned_rule(action, &exe, &path, Some(cwd.as_str()));
                                     rules.push(rule);
                                     if let Err(e) = rules.save_atomic(rules_path) {
-                                        log(&format!("warning: could not persist rule: {e}"));
+                                        warn!("could not persist rule: {e}");
                                     } else {
-                                        log(&format!(
-                                            "learned {:?} {} -> {}",
-                                            action,
-                                            exe,
-                                            path.display()
-                                        ));
+                                        info!("learned {:?} {} -> {}", action, exe, path.display());
                                     }
                                 }
                             }
@@ -222,29 +223,21 @@ fn event_loop(
                         // Dead connection -> deny this access and drop the link so a
                         // restarted UI is picked up on the next prompt.
                         Some(Err(e)) if is_disconnect(&e) => {
-                            log(&format!(
+                            warn!(
                                 "UI disconnected ({e}); denying {} and awaiting reconnect",
                                 path.display()
-                            ));
+                            );
                             *ui = None;
                             false
                         }
                         // Timeout / transient -> deny (watchdog), keep the link.
                         Some(Err(e)) => {
-                            log(&format!(
-                                "prompt failed ({e}); denying {} for {}",
-                                path.display(),
-                                exe
-                            ));
+                            warn!("prompt failed ({e}); denying {} for {}", path.display(), exe);
                             false
                         }
                         // No UI connected right now -> deny (fail-closed).
                         None => {
-                            log(&format!(
-                                "no UI connected; denying {} for {}",
-                                path.display(),
-                                exe
-                            ));
+                            warn!("no UI connected; denying {} for {}", path.display(), exe);
                             false
                         }
                     }
@@ -252,14 +245,15 @@ fn event_loop(
             };
 
             if let Err(e) = fan.respond(ev, allow) {
-                log(&format!("warning: failed to answer event: {e}"));
+                warn!("failed to answer event: {e}");
             }
-            log(&format!(
-                "{} {} -> {}",
-                if allow { "ALLOW" } else { "DENY " },
-                exe,
-                path.display()
-            ));
+            // Per-access outcome: allows are routine (debug); denies are the
+            // security-relevant signal (warn).
+            if allow {
+                debug!("ALLOW {} -> {}", exe, path.display());
+            } else {
+                warn!("DENY {} -> {}", exe, path.display());
+            }
         }
     }
 }
@@ -297,10 +291,6 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-fn log(msg: &str) {
-    eprintln!("[filewalld] {msg}");
 }
 
 #[cfg(test)]
