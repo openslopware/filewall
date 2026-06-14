@@ -1,0 +1,13 @@
+[package]
+name = "filewallctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "filewallctl"
+path = "src/main.rs"
+
+[dependencies]
+filewall-rules.workspace = true
+nix = { workspace = true }

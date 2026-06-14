@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["filewall-proto", "filewall-rules", "filewalld", "filewall-ui"]
+members = [
+  "filewall-proto",
+  "filewall-rules",
+  "filewalld",
+  "filewall-ui",
+  "filewallctl",
+]
 
 [workspace.package]
 version = "0.1.0"
