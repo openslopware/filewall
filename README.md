@@ -10,8 +10,7 @@ policy is attached to the *file*, with an allowlist of binaries permitted to rea
 rather than to each binary.
 
 Built on Linux `fanotify` permission events (`FAN_OPEN_PERM`), which are the only
-primitive that synchronously blocks a syscall pending a userspace decision. See
-`spec.md` for the full background and design rationale.
+primitive that synchronously blocks a syscall pending a userspace decision. 
 
 > **Status: beyond MVP.** The full chain works end-to-end and "Always allow/deny"
 > decisions now persist as learned rules. Some spec features remain deferred — see
@@ -59,19 +58,9 @@ cargo build --release
 cargo test            # 23 unit/integration tests (policy, config, proto, UI link)
 ```
 
-## Try it (end-to-end)
-
-```sh
-./e2e.sh
-```
-
-Runs `filewall-ui` as you and `filewalld` as root against a throwaway
-`~/.filewall-e2e/secret.key`, then shows an allowlisted binary reading with no prompt
-and an unlisted binary triggering the prompt.
-
 ## Configuration
 
-`config.toml` (see the file for a documented example):
+`config.toml` 
 
 ```toml
 default_action = "prompt"          # prompt | allow | deny
@@ -109,8 +98,3 @@ The daemon also re-reads its config and `rules.toml` on `SIGHUP`.
 - mount/filesystem-wide marking; multi-user / per-user sockets and `SO_PEERCRED`.
 - systemd units; PKGBUILD; `notify-send` UI variant.
 - Privilege drop after init.
-
-## Phase 0 spike
-
-`phase0/spike.rs` is the throwaway program used to validate that fanotify permission
-events + pidfd reporting behave as required on this kernel. Kept for reference.
