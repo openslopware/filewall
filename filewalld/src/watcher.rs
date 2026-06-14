@@ -132,4 +132,73 @@ mod tests {
         assert!(wait_for_reload(Duration::from_millis(500)), "RELOAD not set after config write");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn rules_moved_to_triggers_reload() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = tmp_dir("mv");
+        let config_path = dir.join("config.toml");
+        let rules_path = dir.join("rules.toml");
+        std::fs::write(&config_path, b"").unwrap();
+        std::fs::write(&rules_path, b"").unwrap();
+
+        spawn_watcher(&config_path, &rules_path);
+        std::thread::sleep(Duration::from_millis(50));
+
+        RELOAD.store(false, Ordering::SeqCst);
+        // Simulate save_atomic: write to a temp file, then rename into place.
+        let tmp = dir.join(".rules.tmp");
+        std::fs::write(&tmp, b"[[rule]]").unwrap();
+        std::fs::rename(&tmp, &rules_path).unwrap();
+
+        assert!(wait_for_reload(Duration::from_millis(500)), "RELOAD not set after atomic rename of rules");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unrelated_file_does_not_trigger_reload() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = tmp_dir("unrel");
+        let config_path = dir.join("config.toml");
+        let rules_path = dir.join("rules.toml");
+        std::fs::write(&config_path, b"").unwrap();
+        std::fs::write(&rules_path, b"").unwrap();
+
+        spawn_watcher(&config_path, &rules_path);
+        std::thread::sleep(Duration::from_millis(50));
+
+        RELOAD.store(false, Ordering::SeqCst);
+        // Write a file with a different name in the same watched directory.
+        std::fs::write(dir.join("unrelated.txt"), b"noise").unwrap();
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!RELOAD.load(Ordering::SeqCst), "RELOAD was set by an unrelated file write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_parent_both_files_trigger_reload() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // Both files in the same directory — only one add_watch call should be made.
+        let dir = tmp_dir("shared");
+        let config_path = dir.join("config.toml");
+        let rules_path = dir.join("rules.toml");
+        std::fs::write(&config_path, b"").unwrap();
+        std::fs::write(&rules_path, b"").unwrap();
+
+        spawn_watcher(&config_path, &rules_path);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Config triggers reload.
+        RELOAD.store(false, Ordering::SeqCst);
+        std::fs::write(&config_path, b"changed").unwrap();
+        assert!(wait_for_reload(Duration::from_millis(500)), "RELOAD not set for config in shared dir");
+
+        // Rules triggers reload.
+        RELOAD.store(false, Ordering::SeqCst);
+        std::fs::write(&rules_path, b"changed").unwrap();
+        assert!(wait_for_reload(Duration::from_millis(500)), "RELOAD not set for rules in shared dir");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
