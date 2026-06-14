@@ -52,6 +52,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let own_pid = std::process::id();
 
     let rules_path = cfg.rules_path.clone();
+    watcher::spawn_watcher(Path::new(&config_path), &rules_path);
     let mut rules = Rules::load(&rules_path);
 
     log(&format!("loaded config from {config_path}"));
