@@ -63,6 +63,7 @@ pub fn spawn_watcher(config_path: &Path, rules_path: &Path) {
     std::thread::spawn(move || loop {
         let events = match inotify.read_events() {
             Ok(evs) => evs,
+            Err(e) if e == nix::Error::EINTR => continue,
             Err(e) => {
                 eprintln!("[filewalld] watcher: read error ({e}), file watching disabled");
                 break;
