@@ -31,6 +31,10 @@ const FAN_NOFD: libc::c_int = -1;
 const FAN_NOPIDFD: i32 = -1;
 const FAN_EVENT_INFO_TYPE_PIDFD: u8 = 4;
 
+/// How long `read_events` waits per cycle before returning empty so the event
+/// loop can act on a pending `RELOAD`. Bounds worst-case hot-reload latency.
+const RELOAD_POLL_MS: libc::c_int = 500;
+
 #[repr(C)]
 struct EventMetadata {
     event_len: u32,
@@ -116,8 +120,32 @@ impl Fanotify {
         Ok(())
     }
 
-    /// Block until at least one event arrives, returning all events in the read.
+    /// Wait up to ~500 ms for events, returning all events in one read (or an
+    /// empty Vec on timeout). The bounded wait is what lets the event loop pick
+    /// up a pending reload promptly: a config/rules change only flips the
+    /// `RELOAD` atomic, which cannot interrupt a blocking `read()`, so without a
+    /// timeout the reload would stall until the next file access. Polling also
+    /// makes the loop robust to a SIGHUP that gets delivered to another thread.
     pub fn read_events(&self) -> io::Result<Vec<Event>> {
+        let mut pfd = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, RELOAD_POLL_MS) };
+        if rc < 0 {
+            // EINTR (e.g. a SIGHUP that did land here) is not an error: return
+            // empty so the caller checks RELOAD and loops.
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                return Ok(Vec::new());
+            }
+            return Err(e);
+        }
+        if rc == 0 {
+            return Ok(Vec::new()); // timeout: no events, let the loop check RELOAD
+        }
+
         let mut buf = vec![0u8; 8192];
         let n = unsafe {
             libc::read(
