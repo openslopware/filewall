@@ -84,6 +84,25 @@ fn connect_forever(path: &Path) -> UnixStream {
     }
 }
 
+/// Abbreviate a leading `$HOME` to `~` for readability. Only matches whole path
+/// components (so `/home/alice` does not shorten `/home/alice2/...`). An empty
+/// `home` disables abbreviation.
+#[allow(dead_code)] // wired up in a later task when `ask` uses abbreviated paths
+fn abbrev(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = path.strip_prefix(home) {
+        if rest.starts_with('/') {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
 /// Render the prompt. Returns Deny on any failure (fail-closed).
 fn ask(req: &PromptRequest) -> Decision {
     // Plain process name from the executable path for the headline.
@@ -179,5 +198,20 @@ mod tests {
     fn cancel_close_and_error_fail_closed() {
         assert_eq!(classify(Some(1), ""), Decision::DenyOnce); // cancel/close
         assert_eq!(classify(None, ""), Decision::DenyOnce); // killed/no code
+    }
+
+    #[test]
+    fn abbrev_replaces_home_prefix_only() {
+        use super::abbrev;
+        assert_eq!(abbrev("/home/alice/.ssh/id", "/home/alice"), "~/.ssh/id");
+        // Exact home dir.
+        assert_eq!(abbrev("/home/alice", "/home/alice"), "~");
+        // Not under home: unchanged.
+        assert_eq!(abbrev("/etc/hosts", "/home/alice"), "/etc/hosts");
+        // A path that merely starts with the same characters but is a different
+        // dir must NOT be abbreviated.
+        assert_eq!(abbrev("/home/alice2/x", "/home/alice"), "/home/alice2/x");
+        // Empty home (HOME unset) disables abbreviation.
+        assert_eq!(abbrev("/home/alice/.ssh", ""), "/home/alice/.ssh");
     }
 }
