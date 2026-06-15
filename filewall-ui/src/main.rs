@@ -146,7 +146,7 @@ fn ask(req: &PromptRequest) -> Decision {
         .output();
 
     match output {
-        Ok(out) => classify(out.status.code(), &String::from_utf8_lossy(&out.stdout)),
+        Ok(out) => classify(out.status.code()),
         Err(e) => {
             eprintln!("filewall-ui: failed to run zenity: {e}");
             Decision::DenyOnce
@@ -154,13 +154,14 @@ fn ask(req: &PromptRequest) -> Decision {
     }
 }
 
-/// Map a zenity exit code + stdout to a Decision. Fail-closed: anything that
-/// isn't an explicit allow/always choice becomes DenyOnce.
-fn classify(code: Option<i32>, stdout: &str) -> Decision {
-    match (code, stdout.trim()) {
-        (Some(0), _) => Decision::AllowOnce,
-        (_, "Always allow") => Decision::AllowAlways,
-        (_, "Always deny") => Decision::DenyAlways,
+/// Map a yad exit code to a Decision. Fail-closed: only the three explicit
+/// allow/always codes pass; everything else (deny-once button, ESC=252, error,
+/// unknown) becomes DenyOnce.
+fn classify(code: Option<i32>) -> Decision {
+    match code {
+        Some(10) => Decision::AllowOnce,
+        Some(12) => Decision::AllowAlways,
+        Some(13) => Decision::DenyAlways,
         _ => Decision::DenyOnce,
     }
 }
@@ -184,20 +185,18 @@ mod tests {
     }
 
     #[test]
-    fn ok_button_is_allow_once() {
-        assert_eq!(classify(Some(0), ""), Decision::AllowOnce);
+    fn classify_maps_button_codes() {
+        assert_eq!(classify(Some(10)), Decision::AllowOnce);
+        assert_eq!(classify(Some(12)), Decision::AllowAlways);
+        assert_eq!(classify(Some(13)), Decision::DenyAlways);
     }
 
     #[test]
-    fn extra_buttons_map_to_always() {
-        assert_eq!(classify(Some(1), "Always allow\n"), Decision::AllowAlways);
-        assert_eq!(classify(Some(1), "Always deny\n"), Decision::DenyAlways);
-    }
-
-    #[test]
-    fn cancel_close_and_error_fail_closed() {
-        assert_eq!(classify(Some(1), ""), Decision::DenyOnce); // cancel/close
-        assert_eq!(classify(None, ""), Decision::DenyOnce); // killed/no code
+    fn classify_fails_closed_on_everything_else() {
+        assert_eq!(classify(Some(11)), Decision::DenyOnce); // explicit deny-once
+        assert_eq!(classify(Some(252)), Decision::DenyOnce); // yad ESC/close
+        assert_eq!(classify(None), Decision::DenyOnce); // killed / no code
+        assert_eq!(classify(Some(1)), Decision::DenyOnce); // unknown
     }
 
     #[test]
