@@ -101,21 +101,27 @@ fn abbrev(path: &str, home: &str) -> String {
     path.to_string()
 }
 
-/// Render the prompt with yad. Returns Deny on any failure (fail-closed).
-fn ask(req: &PromptRequest) -> Decision {
-    let home = std::env::var("HOME").unwrap_or_default();
+/// Build the Pango-markup dialog text for a prompt. Pure given `home`, so the
+/// rendering — especially the tree-scope warning and the cwd-pin line — is
+/// unit-testable without spawning yad. Every attacker-influenced field is
+/// escaped here.
+fn build_dialog_text(req: &PromptRequest, home: &str) -> String {
+    // Abbreviate $HOME -> ~ then escape markup metachars, in one place.
+    let esc = |s: &str| pango_escape(&abbrev(s, home));
 
-    // Escape every attacker-influenced value; abbreviate paths for readability.
+    // Process base-name for the headline; fall back to full exe if no filename.
     let proc_name = pango_escape(
         &Path::new(&req.exe)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| req.exe.clone()),
     );
-    let exe = pango_escape(&req.exe);
-    let path = pango_escape(&abbrev(&req.path, &home));
-    let object = pango_escape(&abbrev(&req.always_object, &home));
-    let cwd = pango_escape(&abbrev(&req.cwd, &home));
+    let exe = esc(&req.exe);
+    let path = esc(&req.path);
+    let object = esc(&req.always_object);
+    let cwd = esc(&req.cwd);
+    // "<unavailable>" is a program-controlled literal (pango_escape leaves it
+    // markup-safe); req.cmdline is attacker-controlled and must be escaped.
     let cmdline = pango_escape(if req.cmdline.is_empty() {
         "<unavailable>"
     } else {
@@ -137,14 +143,20 @@ fn ask(req: &PromptRequest) -> Decision {
         String::new()
     };
 
-    let text = format!(
+    format!(
         "<b>\u{26A0}  filewall \u{2014} sensitive file access</b>\n\n\
          <b>{proc_name}</b> wants to open:\n    {path}\n\n\
          {scope}\n\n\
          Rule is tied to this program:\n    {exe}{cwd_line}\n\n\
          <small>PID {pid} \u{00B7} cmd: {cmdline}</small>",
         pid = req.pid,
-    );
+    )
+}
+
+/// Render the prompt with yad. Returns Deny on any failure (fail-closed).
+fn ask(req: &PromptRequest) -> Decision {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let text = build_dialog_text(req, &home);
 
     // Scope-aware "Always" labels: ALL (tree) vs file. button=LABEL:CODE.
     let (allow_always, deny_always) = if req.always_tree {
@@ -192,7 +204,7 @@ fn classify(code: Option<i32>) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::classify;
-    use filewall_proto::Decision;
+    use filewall_proto::{Decision, PromptRequest};
 
     #[test]
     fn pango_escape_handles_markup_metachars() {
@@ -235,5 +247,64 @@ mod tests {
         assert_eq!(abbrev("/home/alice2/x", "/home/alice"), "/home/alice2/x");
         // Empty home (HOME unset) disables abbreviation.
         assert_eq!(abbrev("/home/alice/.ssh", ""), "/home/alice/.ssh");
+    }
+
+    fn req_fixture() -> PromptRequest {
+        PromptRequest {
+            pid: 7,
+            exe: "/usr/bin/node".into(),
+            cmdline: "node app.js".into(),
+            cwd: "/home/u/work".into(),
+            path: "/home/u/.ssh/id_ed25519".into(),
+            always_object: "/home/u/.ssh".into(),
+            always_tree: true,
+            always_cwd_pinned: false,
+        }
+    }
+
+    #[test]
+    fn dialog_text_tree_grant_shows_red_all_files_warning() {
+        use super::build_dialog_text;
+        let t = build_dialog_text(&req_fixture(), "/home/u");
+        assert!(t.contains("GRANTS ACCESS TO ALL FILES"));
+        assert!(t.contains("#cc0000"));
+        assert!(t.contains("~/.ssh")); // object abbreviated
+        assert!(!t.contains("remembers only this one file"));
+    }
+
+    #[test]
+    fn dialog_text_file_grant_is_neutral_no_warning() {
+        use super::build_dialog_text;
+        let mut req = req_fixture();
+        req.always_tree = false;
+        req.always_object = "/home/u/.ssh/id_ed25519".into();
+        let t = build_dialog_text(&req, "/home/u");
+        assert!(t.contains("remembers only this one file"));
+        assert!(!t.contains("ALL FILES"));
+        assert!(!t.contains("#cc0000"));
+    }
+
+    #[test]
+    fn dialog_text_cwd_pin_line_present_only_when_pinned() {
+        use super::build_dialog_text;
+        let mut req = req_fixture();
+        req.always_cwd_pinned = true;
+        let t = build_dialog_text(&req, "/home/u");
+        assert!(t.contains("and only while it runs from"));
+        assert!(t.contains("~/work")); // cwd abbreviated
+        req.always_cwd_pinned = false;
+        let t2 = build_dialog_text(&req, "/home/u");
+        assert!(!t2.contains("and only while it runs from"));
+    }
+
+    #[test]
+    fn dialog_text_escapes_malicious_cmdline() {
+        use super::build_dialog_text;
+        let mut req = req_fixture();
+        req.cmdline = "node </span><b>SPOOF".into();
+        let t = build_dialog_text(&req, "/home/u");
+        // The raw injection must NOT survive; the escaped form must be present.
+        assert!(!t.contains("</span><b>SPOOF"));
+        assert!(t.contains("&lt;/span&gt;&lt;b&gt;SPOOF"));
     }
 }
