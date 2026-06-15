@@ -1,7 +1,7 @@
 //! filewall UI helper (unprivileged, runs in the user's session).
 //!
 //! Connects to the daemon's socket, then for each [`PromptRequest`] pops a
-//! zenity dialog and returns the user's [`Decision`]. Fails closed: any zenity
+//! yad dialog and returns the user's [`Decision`]. Fails closed: any yad
 //! error, timeout, or window-close is treated as Deny.
 
 use filewall_proto::{read_msg, write_msg, Decision, PromptRequest, PromptResponse};
@@ -17,7 +17,6 @@ const DEFAULT_SOCKET: &str = "/run/filewall/prompt.sock";
 /// Escape Pango markup metacharacters so attacker-controlled strings (cmdline,
 /// paths) cannot inject tags to spoof the dialog. `&` first to avoid double-
 /// escaping the entities we introduce.
-#[allow(dead_code)] // wired up in a later task when `ask` switches to yad+Pango markup
 fn pango_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -87,7 +86,6 @@ fn connect_forever(path: &Path) -> UnixStream {
 /// Abbreviate a leading `$HOME` to `~` for readability. Only matches whole path
 /// components (so `/home/alice` does not shorten `/home/alice2/...`). An empty
 /// `home` disables abbreviation.
-#[allow(dead_code)] // wired up in a later task when `ask` uses abbreviated paths
 fn abbrev(path: &str, home: &str) -> String {
     if home.is_empty() {
         return path.to_string();
@@ -103,52 +101,77 @@ fn abbrev(path: &str, home: &str) -> String {
     path.to_string()
 }
 
-/// Render the prompt. Returns Deny on any failure (fail-closed).
+/// Render the prompt with yad. Returns Deny on any failure (fail-closed).
 fn ask(req: &PromptRequest) -> Decision {
-    // Plain process name from the executable path for the headline.
-    let proc_name = Path::new(&req.exe)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| req.exe.clone());
+    let home = std::env::var("HOME").unwrap_or_default();
 
-    // --no-markup makes all of this literal, so attacker-controlled cmdline
-    // cannot inject Pango markup to spoof the dialog.
+    // Escape every attacker-influenced value; abbreviate paths for readability.
+    let proc_name = pango_escape(
+        &Path::new(&req.exe)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| req.exe.clone()),
+    );
+    let exe = pango_escape(&req.exe);
+    let path = pango_escape(&abbrev(&req.path, &home));
+    let object = pango_escape(&abbrev(&req.always_object, &home));
+    let cwd = pango_escape(&abbrev(&req.cwd, &home));
+    let cmdline = pango_escape(if req.cmdline.is_empty() {
+        "<unavailable>"
+    } else {
+        &req.cmdline
+    });
+
+    // Scope block: loud red warning for a tree grant, neutral line for a file.
+    let scope = if req.always_tree {
+        format!(
+            "<span foreground=\"#cc0000\"><b>\u{300C}Always allow\u{300D} GRANTS ACCESS TO ALL FILES</b></span>\n\
+             <span foreground=\"#cc0000\">    under {object} \u{2014} every subfolder, not just the file above.</span>"
+        )
+    } else {
+        format!("\u{300C}Always allow\u{300D} remembers only this one file:\n    {object}")
+    };
+    let cwd_line = if req.always_cwd_pinned {
+        format!("\n\u{2026}and only while it runs from {cwd}")
+    } else {
+        String::new()
+    };
+
     let text = format!(
-        "\u{26A0}  filewall — sensitive file access\n\n\
-         Process:     {proc_name}  (PID {pid})\n\
-         Executable:  {exe}\n\
-         Command:     {cmd}\n\
-         Working dir: {cwd}\n\
-         File:        {path}\n\n\
-         Allow this access?",
+        "<b>\u{26A0}  filewall \u{2014} sensitive file access</b>\n\n\
+         <b>{proc_name}</b> wants to open:\n    {path}\n\n\
+         {scope}\n\n\
+         Rule is tied to this program:\n    {exe}{cwd_line}\n\n\
+         <small>PID {pid} \u{00B7} cmd: {cmdline}</small>",
         pid = req.pid,
-        exe = req.exe,
-        cmd = if req.cmdline.is_empty() { "<unavailable>" } else { &req.cmdline },
-        cwd = if req.cwd.is_empty() { "<unavailable>" } else { &req.cwd },
-        path = req.path,
     );
 
-    let output = Command::new("zenity")
+    // Scope-aware "Always" labels: ALL (tree) vs file. button=LABEL:CODE.
+    let (allow_always, deny_always) = if req.always_tree {
+        ("Always allow ALL:12", "Always deny ALL:13")
+    } else {
+        ("Always allow file:12", "Always deny file:13")
+    };
+
+    let output = Command::new("yad")
         .args([
-            "--question",
-            "--no-markup",
             "--title=filewall security prompt",
-            "--width=480",
-            "--ok-label=Allow once",
-            "--cancel-label=Deny once",
-            "--extra-button=Always allow",
-            "--extra-button=Always deny",
-            // Default focus on Deny: an accidental Enter fails closed.
-            "--default-cancel",
+            "--width=520",
+            "--image=dialog-warning",
             "--text",
             &text,
+            // Order: safe Deny once first (default focus); broad Allow-ALL last.
+            "--button=Deny once:11",
+            "--button=Allow once:10",
+            &format!("--button={deny_always}"),
+            &format!("--button={allow_always}"),
         ])
         .output();
 
     match output {
         Ok(out) => classify(out.status.code()),
         Err(e) => {
-            eprintln!("filewall-ui: failed to run zenity: {e}");
+            eprintln!("filewall-ui: failed to run yad: {e}");
             Decision::DenyOnce
         }
     }
