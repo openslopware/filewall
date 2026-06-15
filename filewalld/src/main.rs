@@ -6,6 +6,7 @@ mod config;
 mod fanotify;
 mod policy;
 mod server;
+mod treewatch;
 mod watcher;
 
 use config::Config;
