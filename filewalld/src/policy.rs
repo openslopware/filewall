@@ -95,6 +95,21 @@ impl WatchPolicy {
         })
     }
 
+    /// The object an "Always" rule would target for an access of `path`, per
+    /// this watch's `learn_object`. Single source of truth shared by the prompt
+    /// (what we display) and `learned_rule` (what we persist) so they can't drift.
+    pub fn always_target(&self, path: &Path) -> (PathBuf, ObjectKind) {
+        match self.learn_object {
+            ObjectKind::Tree => (self.root.clone(), ObjectKind::Tree),
+            ObjectKind::File => (path.to_path_buf(), ObjectKind::File),
+        }
+    }
+
+    /// Whether learned rules from this watch pin the process cwd.
+    pub fn learn_cwd(&self) -> bool {
+        self.learn_cwd
+    }
+
     /// Build a learned rule for an access this watch covered, honoring the
     /// watch's `learn_object`/`learn_cwd` policy.
     pub fn learned_rule(
@@ -104,10 +119,7 @@ impl WatchPolicy {
         path: &Path,
         cwd: Option<&str>,
     ) -> LearnedRule {
-        let (object, object_kind) = match self.learn_object {
-            ObjectKind::Tree => (self.root.clone(), ObjectKind::Tree),
-            ObjectKind::File => (path.to_path_buf(), ObjectKind::File),
-        };
+        let (object, object_kind) = self.always_target(path);
         LearnedRule {
             created_unix: now_unix(),
             action,
@@ -317,6 +329,35 @@ mod tests {
         let none =
             WatchPolicy::new("/x", &[], Action::Prompt, ObjectKind::File, false, &[]).unwrap();
         assert!(!none.is_excluded(Path::new("/x/anything/Cache")));
+    }
+
+    #[test]
+    fn always_target_tree_is_root_file_is_path() {
+        let tree = WatchPolicy::new("/home/u/.ssh", &[], Action::Prompt, ObjectKind::Tree, false, &[]).unwrap();
+        let (obj, kind) = tree.always_target(Path::new("/home/u/.ssh/id_ed25519"));
+        assert_eq!(kind, ObjectKind::Tree);
+        assert_eq!(obj, PathBuf::from("/home/u/.ssh"));
+
+        let file = WatchPolicy::new("/home/u/.ssh", &[], Action::Prompt, ObjectKind::File, false, &[]).unwrap();
+        let (obj, kind) = file.always_target(Path::new("/home/u/.ssh/id_ed25519"));
+        assert_eq!(kind, ObjectKind::File);
+        assert_eq!(obj, PathBuf::from("/home/u/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn always_target_agrees_with_learned_rule() {
+        // The scope we would *display* must equal the scope we would *persist*.
+        for kind in [ObjectKind::Tree, ObjectKind::File] {
+            for learn_cwd in [false, true] {
+                let p = WatchPolicy::new("/home/u/.ssh", &[], Action::Prompt, kind, learn_cwd, &[]).unwrap();
+                let path = Path::new("/home/u/.ssh/id_ed25519");
+                let (obj, obj_kind) = p.always_target(path);
+                let rule = p.learned_rule(RuleAction::Allow, "/usr/bin/node", path, Some("/home/u/p"));
+                assert_eq!(rule.object, obj);
+                assert_eq!(rule.object_kind, obj_kind);
+                assert_eq!(rule.cwd.is_some(), p.learn_cwd());
+            }
+        }
     }
 
     #[test]

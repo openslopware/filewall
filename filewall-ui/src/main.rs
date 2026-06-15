@@ -1,7 +1,7 @@
 //! filewall UI helper (unprivileged, runs in the user's session).
 //!
 //! Connects to the daemon's socket, then for each [`PromptRequest`] pops a
-//! zenity dialog and returns the user's [`Decision`]. Fails closed: any zenity
+//! yad dialog and returns the user's [`Decision`]. Fails closed: any yad
 //! error, timeout, or window-close is treated as Deny.
 
 use filewall_proto::{read_msg, write_msg, Decision, PromptRequest, PromptResponse};
@@ -13,6 +13,15 @@ use std::thread::sleep;
 use std::time::Duration;
 
 const DEFAULT_SOCKET: &str = "/run/filewall/prompt.sock";
+
+/// Escape Pango markup metacharacters so attacker-controlled strings (cmdline,
+/// paths) cannot inject tags to spoof the dialog. `&` first to avoid double-
+/// escaping the entities we introduce.
+fn pango_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
 
 fn main() {
     let socket = std::env::args()
@@ -74,64 +83,120 @@ fn connect_forever(path: &Path) -> UnixStream {
     }
 }
 
-/// Render the prompt. Returns Deny on any failure (fail-closed).
-fn ask(req: &PromptRequest) -> Decision {
-    // Plain process name from the executable path for the headline.
-    let proc_name = Path::new(&req.exe)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| req.exe.clone());
+/// Abbreviate a leading `$HOME` to `~` for readability. Only matches whole path
+/// components (so `/home/alice` does not shorten `/home/alice2/...`). An empty
+/// `home` disables abbreviation.
+fn abbrev(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = path.strip_prefix(home) {
+        if rest.starts_with('/') {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
 
-    // --no-markup makes all of this literal, so attacker-controlled cmdline
-    // cannot inject Pango markup to spoof the dialog.
-    let text = format!(
-        "\u{26A0}  filewall — sensitive file access\n\n\
-         Process:     {proc_name}  (PID {pid})\n\
-         Executable:  {exe}\n\
-         Command:     {cmd}\n\
-         Working dir: {cwd}\n\
-         File:        {path}\n\n\
-         Allow this access?",
-        pid = req.pid,
-        exe = req.exe,
-        cmd = if req.cmdline.is_empty() { "<unavailable>" } else { &req.cmdline },
-        cwd = if req.cwd.is_empty() { "<unavailable>" } else { &req.cwd },
-        path = req.path,
+/// Build the Pango-markup dialog text for a prompt. Pure given `home`, so the
+/// rendering — especially the tree-scope warning and the cwd-pin line — is
+/// unit-testable without spawning yad. Every attacker-influenced field is
+/// escaped here.
+fn build_dialog_text(req: &PromptRequest, home: &str) -> String {
+    // Abbreviate $HOME -> ~ then escape markup metachars, in one place.
+    let esc = |s: &str| pango_escape(&abbrev(s, home));
+
+    // Process base-name for the headline; fall back to full exe if no filename.
+    let proc_name = pango_escape(
+        &Path::new(&req.exe)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| req.exe.clone()),
     );
+    let exe = esc(&req.exe);
+    let path = esc(&req.path);
+    let object = esc(&req.always_object);
+    let cwd = esc(&req.cwd);
+    // "<unavailable>" is a program-controlled literal (pango_escape leaves it
+    // markup-safe); req.cmdline is attacker-controlled and must be escaped.
+    let cmdline = pango_escape(if req.cmdline.is_empty() {
+        "<unavailable>"
+    } else {
+        &req.cmdline
+    });
 
-    let output = Command::new("zenity")
+    // Scope block: loud red warning for a tree grant, neutral line for a file.
+    let scope = if req.always_tree {
+        format!(
+            "<span foreground=\"#cc0000\"><b>\u{300C}Always allow\u{300D} GRANTS ACCESS TO ALL FILES</b></span>\n\
+             <span foreground=\"#cc0000\">    under {object} \u{2014} every subfolder, not just the file above.</span>"
+        )
+    } else {
+        format!("\u{300C}Always allow\u{300D} remembers only this one file:\n    {object}")
+    };
+    let cwd_line = if req.always_cwd_pinned {
+        format!("\n\u{2026}and only while it runs from {cwd}")
+    } else {
+        String::new()
+    };
+
+    format!(
+        "<b>\u{26A0}  filewall \u{2014} sensitive file access</b>\n\n\
+         <b>{proc_name}</b> wants to open:\n    {path}\n\n\
+         {scope}\n\n\
+         Rule is tied to this program:\n    {exe}{cwd_line}\n\n\
+         <small>PID {pid} \u{00B7} cmd: {cmdline}</small>",
+        pid = req.pid,
+    )
+}
+
+/// Render the prompt with yad. Returns Deny on any failure (fail-closed).
+fn ask(req: &PromptRequest) -> Decision {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let text = build_dialog_text(req, &home);
+
+    // Scope-aware "Always" labels: ALL (tree) vs file. button=LABEL:CODE.
+    let (allow_always, deny_always) = if req.always_tree {
+        ("Always allow ALL:12", "Always deny ALL:13")
+    } else {
+        ("Always allow file:12", "Always deny file:13")
+    };
+
+    let output = Command::new("yad")
         .args([
-            "--question",
-            "--no-markup",
             "--title=filewall security prompt",
-            "--width=480",
-            "--ok-label=Allow once",
-            "--cancel-label=Deny once",
-            "--extra-button=Always allow",
-            "--extra-button=Always deny",
-            // Default focus on Deny: an accidental Enter fails closed.
-            "--default-cancel",
+            "--width=520",
+            "--image=dialog-warning",
             "--text",
             &text,
+            // Order: safe Deny once first (default focus); broad Allow-ALL last.
+            "--button=Deny once:11",
+            "--button=Allow once:10",
+            &format!("--button={deny_always}"),
+            &format!("--button={allow_always}"),
         ])
         .output();
 
     match output {
-        Ok(out) => classify(out.status.code(), &String::from_utf8_lossy(&out.stdout)),
+        Ok(out) => classify(out.status.code()),
         Err(e) => {
-            eprintln!("filewall-ui: failed to run zenity: {e}");
+            eprintln!("filewall-ui: failed to run yad: {e}");
             Decision::DenyOnce
         }
     }
 }
 
-/// Map a zenity exit code + stdout to a Decision. Fail-closed: anything that
-/// isn't an explicit allow/always choice becomes DenyOnce.
-fn classify(code: Option<i32>, stdout: &str) -> Decision {
-    match (code, stdout.trim()) {
-        (Some(0), _) => Decision::AllowOnce,
-        (_, "Always allow") => Decision::AllowAlways,
-        (_, "Always deny") => Decision::DenyAlways,
+/// Map a yad exit code to a Decision. Fail-closed: only the three explicit
+/// allow/always codes pass; everything else (deny-once button, ESC=252, error,
+/// unknown) becomes DenyOnce.
+fn classify(code: Option<i32>) -> Decision {
+    match code {
+        Some(10) => Decision::AllowOnce,
+        Some(12) => Decision::AllowAlways,
+        Some(13) => Decision::DenyAlways,
         _ => Decision::DenyOnce,
     }
 }
@@ -139,22 +204,107 @@ fn classify(code: Option<i32>, stdout: &str) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::classify;
-    use filewall_proto::Decision;
+    use filewall_proto::{Decision, PromptRequest};
 
     #[test]
-    fn ok_button_is_allow_once() {
-        assert_eq!(classify(Some(0), ""), Decision::AllowOnce);
+    fn pango_escape_handles_markup_metachars() {
+        use super::pango_escape;
+        // Ampersand must be escaped first to avoid double-escaping.
+        assert_eq!(pango_escape("a & b"), "a &amp; b");
+        assert_eq!(pango_escape("<b>x</b>"), "&lt;b&gt;x&lt;/b&gt;");
+        assert_eq!(
+            pango_escape("evil & <span foreground=\"red\">"),
+            "evil &amp; &lt;span foreground=\"red\"&gt;"
+        );
+        assert_eq!(pango_escape("plain text"), "plain text");
     }
 
     #[test]
-    fn extra_buttons_map_to_always() {
-        assert_eq!(classify(Some(1), "Always allow\n"), Decision::AllowAlways);
-        assert_eq!(classify(Some(1), "Always deny\n"), Decision::DenyAlways);
+    fn classify_maps_button_codes() {
+        assert_eq!(classify(Some(10)), Decision::AllowOnce);
+        assert_eq!(classify(Some(12)), Decision::AllowAlways);
+        assert_eq!(classify(Some(13)), Decision::DenyAlways);
     }
 
     #[test]
-    fn cancel_close_and_error_fail_closed() {
-        assert_eq!(classify(Some(1), ""), Decision::DenyOnce); // cancel/close
-        assert_eq!(classify(None, ""), Decision::DenyOnce); // killed/no code
+    fn classify_fails_closed_on_everything_else() {
+        assert_eq!(classify(Some(11)), Decision::DenyOnce); // explicit deny-once
+        assert_eq!(classify(Some(252)), Decision::DenyOnce); // yad ESC/close
+        assert_eq!(classify(None), Decision::DenyOnce); // killed / no code
+        assert_eq!(classify(Some(1)), Decision::DenyOnce); // unknown
+    }
+
+    #[test]
+    fn abbrev_replaces_home_prefix_only() {
+        use super::abbrev;
+        assert_eq!(abbrev("/home/alice/.ssh/id", "/home/alice"), "~/.ssh/id");
+        // Exact home dir.
+        assert_eq!(abbrev("/home/alice", "/home/alice"), "~");
+        // Not under home: unchanged.
+        assert_eq!(abbrev("/etc/hosts", "/home/alice"), "/etc/hosts");
+        // A path that merely starts with the same characters but is a different
+        // dir must NOT be abbreviated.
+        assert_eq!(abbrev("/home/alice2/x", "/home/alice"), "/home/alice2/x");
+        // Empty home (HOME unset) disables abbreviation.
+        assert_eq!(abbrev("/home/alice/.ssh", ""), "/home/alice/.ssh");
+    }
+
+    fn req_fixture() -> PromptRequest {
+        PromptRequest {
+            pid: 7,
+            exe: "/usr/bin/node".into(),
+            cmdline: "node app.js".into(),
+            cwd: "/home/u/work".into(),
+            path: "/home/u/.ssh/id_ed25519".into(),
+            always_object: "/home/u/.ssh".into(),
+            always_tree: true,
+            always_cwd_pinned: false,
+        }
+    }
+
+    #[test]
+    fn dialog_text_tree_grant_shows_red_all_files_warning() {
+        use super::build_dialog_text;
+        let t = build_dialog_text(&req_fixture(), "/home/u");
+        assert!(t.contains("GRANTS ACCESS TO ALL FILES"));
+        assert!(t.contains("#cc0000"));
+        assert!(t.contains("~/.ssh")); // object abbreviated
+        assert!(!t.contains("remembers only this one file"));
+    }
+
+    #[test]
+    fn dialog_text_file_grant_is_neutral_no_warning() {
+        use super::build_dialog_text;
+        let mut req = req_fixture();
+        req.always_tree = false;
+        req.always_object = "/home/u/.ssh/id_ed25519".into();
+        let t = build_dialog_text(&req, "/home/u");
+        assert!(t.contains("remembers only this one file"));
+        assert!(!t.contains("ALL FILES"));
+        assert!(!t.contains("#cc0000"));
+    }
+
+    #[test]
+    fn dialog_text_cwd_pin_line_present_only_when_pinned() {
+        use super::build_dialog_text;
+        let mut req = req_fixture();
+        req.always_cwd_pinned = true;
+        let t = build_dialog_text(&req, "/home/u");
+        assert!(t.contains("and only while it runs from"));
+        assert!(t.contains("~/work")); // cwd abbreviated
+        req.always_cwd_pinned = false;
+        let t2 = build_dialog_text(&req, "/home/u");
+        assert!(!t2.contains("and only while it runs from"));
+    }
+
+    #[test]
+    fn dialog_text_escapes_malicious_cmdline() {
+        use super::build_dialog_text;
+        let mut req = req_fixture();
+        req.cmdline = "node </span><b>SPOOF".into();
+        let t = build_dialog_text(&req, "/home/u");
+        // The raw injection must NOT survive; the escaped form must be present.
+        assert!(!t.contains("</span><b>SPOOF"));
+        assert!(t.contains("&lt;/span&gt;&lt;b&gt;SPOOF"));
     }
 }

@@ -294,12 +294,33 @@ fn event_loop(
                 Outcome::Allow => true,
                 Outcome::Deny => false,
                 Outcome::Prompt => {
+                    // Describe what an "Always" choice would persist, from the
+                    // covering watch's config — same source `learned_rule` uses.
+                    // Fail narrow: if no watch covers it, scope is the literal file.
+                    // One lookup, reused for both the displayed scope and the
+                    // persisted rule below, so they can't refer to different watches.
+                    let covering_watch = policy.watches().iter().find(|w| w.covers(&path));
+                    let (always_object, always_tree, always_cwd_pinned) =
+                        match covering_watch {
+                            Some(w) => {
+                                let (obj, kind) = w.always_target(&path);
+                                (
+                                    obj.display().to_string(),
+                                    matches!(kind, filewall_rules::ObjectKind::Tree),
+                                    w.learn_cwd(),
+                                )
+                            }
+                            None => (path.display().to_string(), false, false),
+                        };
                     let req = PromptRequest {
                         pid: ev.pid,
                         exe: exe.clone(),
                         cmdline: ev.cmdline(),
                         cwd: cwd.clone(),
                         path: path.display().to_string(),
+                        always_object,
+                        always_tree,
+                        always_cwd_pinned,
                     };
                     // Recover a dropped link without blocking the event loop.
                     if ui.is_none() {
@@ -318,9 +339,7 @@ fn event_loop(
                         Some(Ok(decision)) => {
                             // Persist "Always": add in-memory now, mirror to disk.
                             if let Some(action) = always_action(decision) {
-                                if let Some(watch) =
-                                    policy.watches().iter().find(|w| w.covers(&path))
-                                {
+                                if let Some(watch) = covering_watch {
                                     let rule =
                                         watch.learned_rule(action, &exe, &path, Some(cwd.as_str()));
                                     rules.push(rule);

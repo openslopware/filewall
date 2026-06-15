@@ -131,6 +131,9 @@ mod tests {
             cmdline: "node evil.js".into(),
             cwd: "/home/user/projects/foo".into(),
             path: "/home/user/.ssh/id_ed25519".into(),
+            always_object: "/home/user/.ssh".into(),
+            always_tree: true,
+            always_cwd_pinned: false,
         }
     }
 
