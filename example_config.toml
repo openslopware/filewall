@@ -4,13 +4,17 @@
 # different ways to guard sensitive files. Copy it to /etc/filewall/config.toml
 # (the default path) or pass a path as the first argument to `filewalld`.
 #
-# filewalld marks each existing file under every [[watch]] root with a fanotify
-# open-permission event. When a process opens one of those files, the daemon
-# decides — from this config plus any *learned* rules — whether to allow, deny,
-# or prompt the user via the filewall-ui helper.
+# For each [[watch]], filewalld places fanotify open-permission marks: a directory
+# watch marks the directory (and every sub-directory) so the kernel fires for opens
+# of its files — one mark per directory, not per file — while a single-file watch
+# marks just that file. Directory watches therefore cover newly-created and
+# atomically-renamed files automatically, and new sub-directories are live-marked as
+# they appear (via inotify). When a process opens a guarded file, the daemon decides
+# — from this config plus any *learned* rules — whether to allow, deny, or prompt the
+# user via the filewall-ui helper.
 #
 # Hot reload: editing this file (or sending SIGHUP via `filewallctl reload`)
-# re-reads the config and re-marks files within ~half a second. No restart.
+# re-reads the config and re-marks within ~half a second. No restart.
 
 # ─── Global settings ────────────────────────────────────────────────────────
 
@@ -44,11 +48,15 @@ rules_path = "/var/lib/filewall/rules.toml"
 #                 Glob rules: `*` does NOT cross `/`, `**` does. Empty = nothing
 #                 is pre-allowed (every access goes to `default_action`).
 #
-#   exclude       Globs matched against absolute *file* paths under `path`.
-#                 A matching directory prunes its whole subtree (never marked or
-#                 traversed); a matching file is skipped. Use this to keep noisy,
-#                 non-sensitive trees (browser caches, etc.) from exhausting the
-#                 kernel's fanotify mark limit (fs.fanotify.max_user_marks).
+#   exclude       Globs matched against absolute paths under `path`. Two effects:
+#                 - a matching DIRECTORY prunes its whole subtree (never marked or
+#                   traversed) — this is what keeps noisy, non-sensitive trees
+#                   (browser caches, etc.) from exhausting the kernel limits, since a
+#                   directory watch places one fanotify mark AND one inotify watch per
+#                   directory (fs.fanotify.max_user_marks / fs.inotify.max_user_watches).
+#                 - a matching FILE is auto-allowed at access time, with no prompt
+#                   (the parent directory's mark fires for every child, so the daemon
+#                   filters these out itself). Use it to silence known-noisy files.
 #                 Same glob rules as `allow`.
 #
 #   learn_object  What an "Always" decision records: "file" (this exact path,
@@ -107,10 +115,12 @@ learn_object = "file"
 learn_match = ["exe", "cwd"]
 
 
-# Approach 5 — Strict deny-by-default for a high-value directory.
-# With default_action = "prompt" globally, set an explicit lockdown here by
-# leaving `allow` empty and relying on learned deny rules; or run the whole
-# daemon with default_action = "deny" for a fail-closed posture.
+# Approach 5 — Allowlist a toolchain and exclude its churny housekeeping files.
+# GnuPG's own binaries are pre-allowed; everything else hits default_action. The
+# `exclude` globs drop lockfiles and the random seed, which GnuPG rewrites
+# constantly and which carry no secrets — no point prompting on them.
+# (`default_action` is global, not per-watch; for a fail-closed posture on the
+# whole daemon set `default_action = "deny"` at the top of this file.)
 [[watch]]
 path = "~/.gnupg"
 allow = ["/usr/bin/gpg", "/usr/bin/gpg-agent"]

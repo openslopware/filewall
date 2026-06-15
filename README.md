@@ -32,7 +32,9 @@ point of the split — root can't (and shouldn't) pop a dialog into your session
 
 ## How a decision is made
 
-1. Kernel fires a `FAN_OPEN_PERM` event on a marked file and blocks the opener.
+1. Kernel fires a `FAN_OPEN_PERM` event on a guarded file — via the file's own mark,
+   or its parent directory's `FAN_EVENT_ON_CHILD` mark — and blocks the opener. A path
+   matching the watch's `exclude` globs is allowed immediately, without a prompt.
 2. Daemon resolves the accessing process **race-free** via the event's pidfd
    (`/proc/<pid>/exe`, `/proc/<pid>/cmdline`, `/proc/<pid>/cwd`).
 3. The config `allow` globs and the persisted **learned rules** are evaluated
@@ -55,22 +57,30 @@ learned rules are never auto-generalized into globs.
 
 ```sh
 cargo build --release
-cargo test            # 23 unit/integration tests (policy, config, proto, UI link)
+cargo test    # unit/integration tests: policy, config, directory marking, treewatch, rules, proto, UI link
 ```
 
 ## Configuration
 
-`config.toml` 
+A watch on a directory marks the directory itself (with `FAN_EVENT_ON_CHILD`), so
+its files are covered with one kernel mark per directory rather than one per file —
+**newly-created files and atomically-renamed files are covered automatically**, and
+new sub-directories are live-marked as they appear. A watch on a single file marks
+that file directly.
+
+`config.toml` (see [`example_config.toml`](example_config.toml) for every option,
+fully commented):
 
 ```toml
-default_action = "prompt"          # prompt | allow | deny
+default_action = "prompt"          # prompt | allow | deny (global; no per-watch default)
 prompt_timeout_seconds = 30
 socket_path = "/run/filewall/prompt.sock"
 rules_path  = "/var/lib/filewall/rules.toml"   # where "Always" decisions persist
 
 [[watch]]
-path = "/home/you/.ssh"            # use ABSOLUTE paths (daemon runs as root)
+path = "/home/you/.ssh"            # ~ expands to $HOME; symlinked roots are canonicalized
 allow = ["/usr/bin/ssh", "/usr/bin/ssh-*", "/usr/bin/git"]
+exclude = ["**/Cache"]             # prune noisy subtrees; file globs auto-allow at access time
 learn_object = "file"              # "file" | "tree" — scope of an "Always" rule
 learn_match  = ["exe"]             # add "cwd" to pin the working directory too
 ```
