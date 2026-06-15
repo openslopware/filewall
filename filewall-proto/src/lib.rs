@@ -22,6 +22,12 @@ pub struct PromptRequest {
     pub cwd: String,
     /// The watched file path being accessed.
     pub path: String,
+    /// Path an "Always" rule would cover: the exact file, or a tree root.
+    pub always_object: String,
+    /// True when the rule covers every file under `always_object` (tree scope).
+    pub always_tree: bool,
+    /// True when the rule is pinned to the process's current cwd.
+    pub always_cwd_pinned: bool,
 }
 
 /// The user's decision for a single access. `*Once` are one-shot; `*Always`
@@ -93,7 +99,20 @@ mod tests {
             cmdline: "node /home/user/evil.js".into(),
             cwd: "/home/user/projects/foo".into(),
             path: "/home/user/.ssh/id_ed25519".into(),
+            always_object: "/home/user/.ssh".into(),
+            always_tree: true,
+            always_cwd_pinned: false,
         }
+    }
+
+    #[test]
+    fn request_roundtrip_preserves_scope_fields() {
+        let req = sample_request();
+        let back: PromptRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back.always_object, "/home/user/.ssh");
+        assert!(back.always_tree);
+        assert!(!back.always_cwd_pinned);
     }
 
     #[test]
