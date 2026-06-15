@@ -20,7 +20,7 @@ primitive that synchronously blocks a syscall pending a userspace decision.
 
 | Crate / binary | Privilege | Role |
 |----------------|-----------|------|
-| `filewalld`      | root (`CAP_SYS_ADMIN`) | Marks watched files, evaluates accesses against the allowlist **and learned rules**, asks the UI on a miss, persists "Always" decisions, answers the kernel. |
+| `filewalld`      | root (`CAP_SYS_ADMIN`) | Marks watched paths (single files directly; directories via `FAN_EVENT_ON_CHILD`, so new files and atomically-renamed files are covered automatically and new subdirs are live-marked via inotify), evaluates accesses against the allowlist **and learned rules**, asks the UI on a miss, persists "Always" decisions, answers the kernel. |
 | `filewall-ui`    | user session | Renders the 4-button zenity prompt and returns the decision. |
 | `filewallctl`    | user (root for live paths) | Lists/removes learned rules; reloads (`SIGHUP`) and reports daemon status. |
 | `filewall-proto` | library | Shared length-prefixed-JSON IPC types. |
@@ -93,8 +93,6 @@ The daemon also re-reads its config and `rules.toml` on `SIGHUP`.
 
 ## Deferred (post-MVP)
 
-- inotify-driven marking of **newly-created** files (marks only files present at
-  startup). Per-inode marks don't catch new files.
 - mount/filesystem-wide marking; multi-user / per-user sockets and `SO_PEERCRED`.
 - systemd units; PKGBUILD; `notify-send` UI variant.
 - Privilege drop after init.
