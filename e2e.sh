@@ -6,10 +6,11 @@
 # or in the Claude session:
 #     ! /home/pulsar/slowdata/development/priv/filewall/e2e.sh
 #
-# It starts filewall-ui as you (so zenity reaches your session) and filewalld as
+# It starts filewall-ui as you (so yad reaches your session) and filewalld as
 # root (via the zenity askpass helper for the sudo password), then exercises:
 #   1. an ALLOWED binary  (head)  -> reads with NO prompt
 #   2. an UNLISTED binary (cat)   -> pops the filewall prompt; you click Allow/Deny
+# Prereqs: yad (filewall-ui dialog) and zenity (sudo askpass helper).
 set -u
 cd "$(dirname "$0")"
 ROOT="$(pwd)"

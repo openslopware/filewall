@@ -21,7 +21,7 @@ primitive that synchronously blocks a syscall pending a userspace decision.
 | Crate / binary | Privilege | Role |
 |----------------|-----------|------|
 | `filewalld`      | root (`CAP_SYS_ADMIN`) | Marks watched paths (single files directly; directories via `FAN_EVENT_ON_CHILD`, so new files and atomically-renamed files are covered automatically and new subdirs are live-marked via inotify), evaluates accesses against the allowlist **and learned rules**, asks the UI on a miss, persists "Always" decisions, answers the kernel. |
-| `filewall-ui`    | user session | Renders the 4-button zenity prompt and returns the decision. |
+| `filewall-ui`    | user session | Renders the 4-button yad prompt and returns the decision. |
 | `filewallctl`    | user (root for live paths) | Lists/removes learned rules; reloads (`SIGHUP`) and reports daemon status. |
 | `filewall-proto` | library | Shared length-prefixed-JSON IPC types. |
 | `filewall-rules` | library | Learned-rule schema, atomic `rules.toml` store, deny-wins matcher (shared by daemon + ctl). |
@@ -89,6 +89,11 @@ Glob semantics: `*` does not cross `/`; `**` does.
 
 Run the daemon: `sudo ./target/release/filewalld /path/to/config.toml`
 Run the UI:     `./target/release/filewall-ui`
+
+> **Dependency:** `filewall-ui` requires **`yad`** (a GTK dialog tool) in the
+> user's session — install it with e.g. `sudo pacman -S yad` or
+> `sudo apt install yad`. It renders the access prompt with markup so a broad
+> (whole-tree) "Always allow" grant is visually distinct from a single-file one.
 
 ## Managing learned rules
 
