@@ -21,6 +21,10 @@ const FAN_REPORT_PIDFD: libc::c_uint = 0x0000_0080;
 // fanotify_mark flags / masks
 const FAN_MARK_ADD: libc::c_uint = 0x0000_0001;
 const FAN_OPEN_PERM: u64 = 0x0001_0000;
+// Generate events for the immediate children of a marked directory (NOT
+// recursive). FAN_ONDIR (0x40000000) is intentionally NOT set, so opening the
+// subdirectories themselves produces no event — only opens of files within.
+const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
 
 // responses
 const FAN_ALLOW: u32 = 0x01;
@@ -75,6 +79,12 @@ pub struct Fanotify {
     fd: OwnedFd,
 }
 
+impl AsRawFd for Fanotify {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
 /// A single permission event. Owns the file fd (and pidfd, if any); both are
 /// closed on drop. Answer it via [`Fanotify::respond`] before dropping.
 pub struct Event {
@@ -104,12 +114,24 @@ impl Fanotify {
 
     /// Add a `FAN_OPEN_PERM` mark on a single file inode.
     pub fn mark_file(&self, path: &std::path::Path) -> io::Result<()> {
+        self.mark(path, FAN_OPEN_PERM)
+    }
+
+    /// Add a `FAN_OPEN_PERM | FAN_EVENT_ON_CHILD` mark on a directory inode, so opens
+    /// of its immediate children (files) generate permission events without a
+    /// per-file mark. Not recursive — subdirectories must be marked separately.
+    pub fn mark_dir(&self, path: &std::path::Path) -> io::Result<()> {
+        self.mark(path, FAN_OPEN_PERM | FAN_EVENT_ON_CHILD)
+    }
+
+    /// Shared `FAN_MARK_ADD` body for [`mark_file`] / [`mark_dir`].
+    fn mark(&self, path: &std::path::Path, mask: u64) -> io::Result<()> {
         let c_path = path_to_cstring(path)?;
         let rc = unsafe {
             fanotify_mark(
                 self.fd.as_raw_fd(),
                 FAN_MARK_ADD,
-                FAN_OPEN_PERM,
+                mask,
                 FAN_NOFD,
                 c_path.as_ptr(),
             )
@@ -145,7 +167,14 @@ impl Fanotify {
         if rc == 0 {
             return Ok(Vec::new()); // timeout: no events, let the loop check RELOAD
         }
+        self.read_ready()
+    }
 
+    /// Read and parse all currently-ready events without polling. Call only when a
+    /// prior `poll()` has reported `POLLIN` on this fd (e.g. the event loop's
+    /// combined poll over fanotify + treewatch). Returns an empty Vec on a 0-byte
+    /// read.
+    pub fn read_ready(&self) -> io::Result<Vec<Event>> {
         let mut buf = vec![0u8; 8192];
         let n = unsafe {
             libc::read(
