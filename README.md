@@ -21,7 +21,7 @@ primitive that synchronously blocks a syscall pending a userspace decision.
 | Crate / binary | Privilege | Role |
 |----------------|-----------|------|
 | `filewalld`      | root (`CAP_SYS_ADMIN`) | Marks watched paths (single files directly; directories via `FAN_EVENT_ON_CHILD`, so new files and atomically-renamed files are covered automatically and new subdirs are live-marked via inotify), evaluates accesses against the allowlist **and learned rules**, asks the UI on a miss, persists "Always" decisions, answers the kernel. |
-| `filewall-ui`    | user session | Renders the 4-button yad prompt and returns the decision. |
+| `filewall-ui`    | user session | Renders the scope-aware **yad** prompt — showing whether an "Always" rule will cover one file or a whole tree — and returns the decision. |
 | `filewallctl`    | user (root for live paths) | Lists/removes learned rules; reloads (`SIGHUP`) and reports daemon status. |
 | `filewall-proto` | library | Shared length-prefixed-JSON IPC types. |
 | `filewall-rules` | library | Learned-rule schema, atomic `rules.toml` store, deny-wins matcher (shared by daemon + ctl). |
@@ -42,8 +42,12 @@ point of the split — root can't (and shouldn't) pop a dialog into your session
    - any matching deny → `FAN_DENY`
    - else any matching allow (config glob or learned rule) → `FAN_ALLOW`
    - else → prompt the user, who picks **Allow once / Deny once / Always allow /
-     Always deny**. An "Always" choice is persisted to `rules.toml` (and applied
-     immediately).
+     Always deny**. The dialog states exactly what an "Always" choice will
+     persist — just the file shown, or the whole watched tree (per `learn_object`),
+     and the program the rule is tied to — with a prominent warning when the grant
+     would cover an entire tree. The choice is persisted to `rules.toml` (and
+     applied immediately). The default keyboard action (Enter/Escape) is the
+     fail-closed **Deny once**.
    - no answer within `prompt_timeout_seconds` → **deny** (fail-closed)
 4. A denied open returns **`EPERM`** ("Operation not permitted") to the caller.
 
@@ -52,6 +56,17 @@ the triggering file or the whole watched tree (`learn_object`), optionally
 constrained by the process working directory (`learn_match = ["exe","cwd"]`). `cwd`
 is attacker-controllable, so it narrows prompts but is never a security boundary;
 learned rules are never auto-generalized into globs.
+
+## Prerequisites
+
+- **Rust** (stable) with `cargo` — to build the workspace.
+- **Linux with fanotify permission events.** `filewalld` runs as root
+  (`CAP_SYS_ADMIN`); `FAN_OPEN_PERM` is a Linux-only primitive.
+- **[`yad`](https://github.com/v1cont/yad)** — the GTK dialog tool that
+  `filewall-ui` shells out to for the access prompt. Install it before running
+  the UI: `sudo pacman -S yad` (Arch) · `sudo apt install yad` (Debian/Ubuntu).
+  If `yad` is missing the UI cannot render a prompt, so **every prompt fails
+  closed (denied)**.
 
 ## Build & test
 
@@ -90,10 +105,9 @@ Glob semantics: `*` does not cross `/`; `**` does.
 Run the daemon: `sudo ./target/release/filewalld /path/to/config.toml`
 Run the UI:     `./target/release/filewall-ui`
 
-> **Dependency:** `filewall-ui` requires **`yad`** (a GTK dialog tool) in the
-> user's session — install it with e.g. `sudo pacman -S yad` or
-> `sudo apt install yad`. It renders the access prompt with markup so a broad
-> (whole-tree) "Always allow" grant is visually distinct from a single-file one.
+> Needs **`yad`** in the session (see [Prerequisites](#prerequisites)); the
+> prompt is rendered with markup so a broad (whole-tree) "Always allow" grant is
+> visually distinct from a single-file one.
 
 ## Managing learned rules
 
