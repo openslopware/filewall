@@ -14,6 +14,16 @@ use std::time::Duration;
 
 const DEFAULT_SOCKET: &str = "/run/filewall/prompt.sock";
 
+/// Escape Pango markup metacharacters so attacker-controlled strings (cmdline,
+/// paths) cannot inject tags to spoof the dialog. `&` first to avoid double-
+/// escaping the entities we introduce.
+#[allow(dead_code)] // wired up in a later task when `ask` switches to yad+Pango markup
+fn pango_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn main() {
     let socket = std::env::args()
         .nth(1)
@@ -140,6 +150,19 @@ fn classify(code: Option<i32>, stdout: &str) -> Decision {
 mod tests {
     use super::classify;
     use filewall_proto::Decision;
+
+    #[test]
+    fn pango_escape_handles_markup_metachars() {
+        use super::pango_escape;
+        // Ampersand must be escaped first to avoid double-escaping.
+        assert_eq!(pango_escape("a & b"), "a &amp; b");
+        assert_eq!(pango_escape("<b>x</b>"), "&lt;b&gt;x&lt;/b&gt;");
+        assert_eq!(
+            pango_escape("evil & <span foreground=\"red\">"),
+            "evil &amp; &lt;span foreground=\"red\"&gt;"
+        );
+        assert_eq!(pango_escape("plain text"), "plain text");
+    }
 
     #[test]
     fn ok_button_is_allow_once() {
