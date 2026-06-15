@@ -16,12 +16,18 @@ use filewall_rules::{RuleAction, Rules};
 use log::{debug, info, warn};
 use policy::{combine, Outcome, Policy, WatchPolicy};
 use server::{is_disconnect, UiLink, UiServer};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const DEFAULT_CONFIG: &str = "/etc/filewall/config.toml";
 const PIDFILE: &str = "/run/filewall/filewalld.pid";
+
+/// How long the event loop blocks in `poll` per cycle before falling through to the
+/// `RELOAD` check. A config/rules change only flips the `RELOAD` atomic, which cannot
+/// interrupt a blocking `read()`, so this bounds worst-case hot-reload latency.
+const RELOAD_POLL_MS: libc::c_int = 500;
 
 pub(crate) static RELOAD: AtomicBool = AtomicBool::new(false);
 
@@ -98,12 +104,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut ui = Some(server.accept()?);
     info!("UI helper connected");
 
-    // Now mark every existing file under each watched root.
+    // Now mark every watched root (files directly; directories via ON_CHILD).
     let marked = mark_all(&fan, &policy);
-    info!("marked {marked} file(s); entering event loop");
+    info!("marked {marked} inode(s); entering event loop");
+
+    // Live-mark new subdirectories as they appear under directory watches.
+    let mut treewatch = treewatch::TreeWatch::build(&policy);
 
     event_loop(
-        &fan, &mut policy, &mut rules, &rules_path, &config_path, &server, &mut ui, own_pid,
+        &fan, &mut policy, &mut rules, &rules_path, &config_path, &server, &mut ui,
+        &mut treewatch, own_pid,
     )
 }
 
@@ -191,14 +201,41 @@ fn event_loop(
     config_path: &str,
     server: &UiServer,
     ui: &mut Option<UiLink>,
+    treewatch: &mut treewatch::TreeWatch,
     own_pid: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let events = match fan.read_events() {
-            Ok(evs) => evs,
-            // A SIGHUP interrupts the blocking read; fall through to reload.
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => Vec::new(),
-            Err(e) => return Err(e.into()),
+        // Poll the fanotify fd and the treewatch inotify fd together. A bounded
+        // timeout lets a pending RELOAD (set by the config/rules watcher thread or a
+        // SIGHUP, neither of which can interrupt a blocking read) be acted on
+        // promptly.
+        let mut fds = [
+            libc::pollfd { fd: fan.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: treewatch.raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, RELOAD_POLL_MS) };
+        let events = if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            // EINTR (e.g. a SIGHUP that landed here) is not an error: fall through to
+            // the RELOAD check with no events.
+            if e.raw_os_error() == Some(libc::EINTR) {
+                Vec::new()
+            } else {
+                return Err(e.into());
+            }
+        } else if rc == 0 {
+            Vec::new() // timeout: no events, just check RELOAD
+        } else {
+            // Drain new-subdirectory marks first, so files in a just-appeared subdir
+            // are likelier covered before we process the fanotify backlog.
+            if fds[1].revents & libc::POLLIN != 0 {
+                treewatch.on_ready(fan, policy);
+            }
+            if fds[0].revents & libc::POLLIN != 0 {
+                fan.read_ready()?
+            } else {
+                Vec::new()
+            }
         };
 
         if RELOAD.swap(false, Ordering::SeqCst) {
@@ -209,8 +246,10 @@ fn event_loop(
                         *policy = new_policy;
                         *rules = Rules::load(rules_path);
                         let n = mark_all(fan, policy);
+                        // Rebuild the inotify watch set to match the re-marked dirs.
+                        *treewatch = treewatch::TreeWatch::build(policy);
                         info!(
-                            "reloaded config + {} rule(s); re-marked {n} file(s)",
+                            "reloaded config + {} rule(s); re-marked {n} inode(s)",
                             rules.rules.len()
                         );
                     }
@@ -228,6 +267,19 @@ fn event_loop(
             }
 
             let path = ev.accessed_path().unwrap_or_else(|_| PathBuf::from("<unknown>"));
+
+            // File-level excludes: a directory's ON_CHILD mark fires for *every* child,
+            // so per-file exclude globs are no longer suppressed by the kernel — honor
+            // them here. (Done before exe/cwd resolution so we don't pay that cost on
+            // an access we're going to allow anyway.)
+            if let Some(w) = policy.watches().iter().find(|w| w.covers(&path)) {
+                if w.is_excluded(&path) {
+                    let _ = fan.respond(ev, true);
+                    debug!("ALLOW (excluded) pid {} -> {}", ev.pid, path.display());
+                    continue;
+                }
+            }
+
             // The held pidfd is what makes exe()/cmdline() race-free; warn if the
             // kernel didn't deliver one (then resolution is best-effort).
             if !ev.has_pidfd() {
