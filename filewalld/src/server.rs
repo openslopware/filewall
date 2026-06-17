@@ -48,20 +48,14 @@ impl UiServer {
         })
     }
 
-    /// Block until the UI helper connects.
-    pub fn accept(&self) -> io::Result<UiLink> {
-        let (stream, _addr) = self.listener.accept()?;
-        // The read timeout is the prompt watchdog.
-        stream.set_read_timeout(Some(self.timeout))?;
-        Ok(UiLink { stream })
-    }
-
     /// Try to pick up a waiting UI without blocking. `Ok(None)` means none is
-    /// waiting. Lets the event loop recover a dropped link without stalling.
+    /// waiting. The daemon never blocks on a UI: it marks files at startup and
+    /// uses this in the event loop to accept the first UI (and recover a dropped
+    /// link) without stalling.
     pub fn try_accept(&self) -> io::Result<Option<UiLink>> {
         self.listener.set_nonblocking(true)?;
         let res = self.listener.accept();
-        // Restore blocking mode so the startup `accept()` path keeps working.
+        // Restore blocking mode (the listener is otherwise only ever used here).
         let _ = self.listener.set_nonblocking(false);
         match res {
             Ok((stream, _addr)) => {
@@ -149,7 +143,7 @@ mod tests {
             write_msg(&mut c, &PromptResponse { decision: Decision::AllowOnce }).unwrap();
         });
 
-        let mut link = server.accept().unwrap();
+        let mut link = try_accept_with_retry(&server);
         assert_eq!(link.prompt(&sample_req()).unwrap(), Decision::AllowOnce);
         client.join().unwrap();
     }
@@ -166,7 +160,7 @@ mod tests {
             thread::sleep(Duration::from_millis(900));
         });
 
-        let mut link = server.accept().unwrap();
+        let mut link = try_accept_with_retry(&server);
         let res = link.prompt(&sample_req());
         assert!(res.is_err(), "expected timeout error, got {res:?}");
         client.join().unwrap();
@@ -182,7 +176,7 @@ mod tests {
             drop(c); // disconnect immediately
         });
 
-        let mut link = server.accept().unwrap();
+        let mut link = try_accept_with_retry(&server);
         // Writing/reading against a closed peer must error (caller -> deny).
         let res = link.prompt(&sample_req());
         assert!(res.is_err(), "expected error on disconnect, got {res:?}");
@@ -247,7 +241,7 @@ mod tests {
             let c = UnixStream::connect(&sock2).unwrap();
             drop(c);
         });
-        let mut link1 = server.accept().unwrap();
+        let mut link1 = try_accept_with_retry(&server);
         let err = link1.prompt(&sample_req()).unwrap_err();
         assert!(is_disconnect(&err), "dropped peer should classify as disconnect, got {err:?}");
         client1.join().unwrap();

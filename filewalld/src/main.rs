@@ -92,24 +92,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!("could not write pidfile {}: {e}", pidfile.display());
     }
 
-    // Bind and wait for the UI helper BEFORE marking files, so there is never a
-    // window where marks exist but no one can answer prompts.
+    // Bind the socket, then mark watched files immediately so protection is
+    // active before any UI connects (e.g. at boot, before a user logs in). An
+    // access that needs a prompt fails closed (deny) until filewall-ui connects;
+    // the link is accepted lazily in the event loop's Outcome::Prompt branch. We
+    // deliberately trade the old "never mark before a UI can answer" guarantee for
+    // boot-time coverage, since the no-UI path denies.
     let server = UiServer::bind(&cfg.socket_path, timeout)?;
-    info!(
-        "listening on {}; waiting for filewall-ui to connect...",
-        cfg.socket_path.display()
-    );
-    // Block for the first UI at startup; thereafter the link is recovered
-    // non-blockingly in the event loop, so it is held as an Option.
-    let mut ui = Some(server.accept()?);
-    info!("UI helper connected");
+    info!("listening on {}", cfg.socket_path.display());
 
-    // Now mark every watched root (files directly; directories via ON_CHILD).
+    // Mark every watched root (files directly; directories via ON_CHILD).
     let marked = mark_all(&fan, &policy);
-    info!("marked {marked} inode(s); entering event loop");
+    info!("marked {marked} inode(s); entering event loop (UI connects on demand)");
 
     // Live-mark new subdirectories as they appear under directory watches.
     let mut treewatch = treewatch::TreeWatch::build(&policy);
+
+    // No UI yet: the event loop's non-blocking try_accept picks one up on the
+    // first prompt (before prompt() in the same iteration), so a UI already
+    // waiting in the listen backlog is used rather than denied.
+    let mut ui: Option<UiLink> = None;
 
     event_loop(
         &fan, &mut policy, &mut rules, &rules_path, &config_path, &server, &mut ui,
