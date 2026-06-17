@@ -12,9 +12,10 @@ rather than to each binary.
 Built on Linux `fanotify` permission events (`FAN_OPEN_PERM`), which are the only
 primitive that synchronously blocks a syscall pending a userspace decision. 
 
-> **Status: beyond MVP.** The full chain works end-to-end and "Always allow/deny"
-> decisions now persist as learned rules. Some spec features remain deferred — see
-> *Deferred* below.
+> **Status: beyond MVP.** The full chain works end-to-end, "Always allow/deny"
+> decisions persist as learned rules, and the daemon + UI ship as systemd services
+> with an Arch [`PKGBUILD`](packaging/PKGBUILD). Some spec features remain
+> deferred — see *Deferred* below.
 
 ## Components
 
@@ -51,6 +52,14 @@ point of the split — root can't (and shouldn't) pop a dialog into your session
    - no answer within `prompt_timeout_seconds` → **deny** (fail-closed)
 4. A denied open returns **`EPERM`** ("Operation not permitted") to the caller.
 
+**Startup & fail-closed.** The daemon places its marks **immediately at startup**,
+before any UI has connected — so guarded files are protected from the moment
+`filewalld` is running (e.g. at boot, before anyone logs in). While no `filewall-ui`
+is connected, any access that *would* prompt is **denied** (fail-closed); the daemon
+picks up the UI the moment it connects (it keeps listening and re-accepts a dropped
+link non-blockingly). On a packaged install the system daemon starts at boot and the
+per-user UI starts with the graphical session.
+
 A learned rule pins the **literal** executable path (the trust anchor) to either
 the triggering file or the whole watched tree (`learn_object`), optionally
 constrained by the process working directory (`learn_match = ["exe","cwd"]`). `cwd`
@@ -75,6 +84,52 @@ cargo build --release
 cargo test    # unit/integration tests: policy, config, directory marking, treewatch, rules, proto, UI link
 ```
 
+## Installation
+
+### Arch Linux (PKGBUILD)
+
+The [`packaging/`](packaging/) directory holds the systemd units, the config
+template, and a `PKGBUILD`. The shipped `PKGBUILD` is a **local working-tree
+build** — it compiles the checkout it lives in (including uncommitted changes),
+which is convenient for iterating but not chroot-clean:
+
+```sh
+cd packaging
+makepkg -si        # build + install filewall, plus its yad dependency
+```
+
+This installs the three binaries to `/usr/bin/`, the config template to
+`/etc/filewall/config.toml` (a pacman `backup` file — your edits survive upgrades,
+new options arrive as `.pacnew`), and the units below.
+
+### Enabling the services
+
+filewall is two systemd scopes — a **system** daemon and a **per-user** UI:
+
+```sh
+# 1. Edit the config (absolute paths — see the ~ note under Configuration):
+sudoedit /etc/filewall/config.toml
+
+# 2. Start the privileged daemon (system-wide, runs as root):
+sudo systemctl enable --now filewalld.service
+
+# 3. Start the prompt UI in your graphical session (per-user):
+systemctl --user enable --now filewall-ui.service
+```
+
+The daemon's `RuntimeDirectory`/`StateDirectory` provide `/run/filewall` (socket +
+pidfile) and `/var/lib/filewall` (learned `rules.toml`) automatically.
+
+> **Bare window managers:** if your WM doesn't import the session environment into
+> the systemd user manager, `filewall-ui` won't see `$DISPLAY`/`$WAYLAND_DISPLAY`.
+> Add to your session startup (e.g. `~/.xinitrc`):
+> `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS`.
+> A missing display degrades safely — the UI fails closed (deny).
+
+> **Large trees:** if `journalctl -u filewalld` shows mark/watch-limit warnings,
+> raise `fs.fanotify.max_user_marks` and `fs.inotify.max_user_watches` via
+> `/etc/sysctl.d/` (the package's post-install message shows the exact commands).
+
 ## Configuration
 
 A watch on a directory marks the directory itself (with `FAN_EVENT_ON_CHILD`), so
@@ -93,7 +148,7 @@ socket_path = "/run/filewall/prompt.sock"
 rules_path  = "/var/lib/filewall/rules.toml"   # where "Always" decisions persist
 
 [[watch]]
-path = "/home/you/.ssh"            # ~ expands to $HOME; symlinked roots are canonicalized
+path = "/home/you/.ssh"            # ~ expands to the daemon's $HOME; symlinked roots are canonicalized
 allow = ["/usr/bin/ssh", "/usr/bin/ssh-*", "/usr/bin/git"]
 exclude = ["**/Cache"]             # prune noisy subtrees; file globs auto-allow at access time
 learn_object = "file"              # "file" | "tree" — scope of an "Always" rule
@@ -102,12 +157,21 @@ learn_match  = ["exe"]             # add "cwd" to pin the working directory too
 
 Glob semantics: `*` does not cross `/`; `**` does.
 
-Run the daemon: `sudo ./target/release/filewalld /path/to/config.toml`
-Run the UI:     `./target/release/filewall-ui`
+> **`~` resolves to the *daemon's* home.** As a system service `filewalld` runs as
+> **root**, so `~` expands to `/root`, not your login home. To guard a user's files
+> under the packaged service, write the **absolute** path (e.g. `/home/alice/.ssh`).
+> The shipped `/etc/filewall/config.toml` is a commented template with no active
+> watches, so the daemon starts clean and guards nothing until you opt in.
+
+Run the daemon (dev): `sudo ./target/release/filewalld /path/to/config.toml`
+Run the UI (dev):     `./target/release/filewall-ui`
 
 > Needs **`yad`** in the session (see [Prerequisites](#prerequisites)); the
 > prompt is rendered with markup so a broad (whole-tree) "Always allow" grant is
 > visually distinct from a single-file one.
+
+For a packaged install that runs both as managed services, see
+[Installation](#installation).
 
 ## Managing learned rules
 
@@ -122,6 +186,27 @@ The daemon also re-reads its config and `rules.toml` on `SIGHUP`.
 
 ## Deferred (post-MVP)
 
-- mount/filesystem-wide marking; multi-user / per-user sockets and `SO_PEERCRED`.
-- systemd units; PKGBUILD; `notify-send` UI variant.
-- Privilege drop after init.
+Core daemon/UI:
+- mount/filesystem-wide marking.
+- multi-user / per-user sockets and `SO_PEERCRED`. The daemon holds a **single** UI
+  link over one global `0o666` socket, so it serves **one interactive user at a
+  time** — fast-user-switching / multi-seat is not supported.
+- privilege drop after init (the daemon stays root for its lifetime).
+- `notify-send` UI variant (currently `yad`-only).
+
+Packaging (recommended follow-ups identified while adding the systemd/PKGBUILD support):
+- **Tighten the daemon unit's sandbox.** `packaging/systemd/filewalld.service`
+  intentionally ships with only seccomp/capability hardening; mount-namespace
+  directives are omitted because they can blind a daemon that must see the whole
+  filesystem and every process's `/proc`. Worth testing, one at a time, whether
+  `ProtectSystem=strict` (read-only fs — the daemon only *reads* watched inodes) can
+  be enabled without breaking fanotify. `ProtectHome`/`ProtectProc` are expected to
+  break it and must stay off.
+- **A reproducible PKGBUILD variant.** The shipped `PKGBUILD` builds the local
+  working tree. Add a tagged-release (tarball) or VCS (`-git`) variant for
+  chroot-clean, reproducible builds once the project is tagged.
+- **Commit `Cargo.lock`.** It is currently git-ignored; committing it is a
+  prerequisite for reproducible packaged builds (the `PKGBUILD` builds with
+  `--locked`).
+- **Ship man pages.** The units reference no `Documentation=` because none exist
+  yet; add `man` pages for `filewalld`/`filewall-ui`/`filewallctl` and wire them up.
