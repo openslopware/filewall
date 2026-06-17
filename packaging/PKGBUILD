@@ -1,0 +1,68 @@
+# Maintainer: Paul Rogalinski-Pinter <paul.rogalinski-pinter@4screen.com>
+#
+# Local working-tree build: this PKGBUILD compiles the repository it lives in
+# (one level up from this file), so it includes uncommitted changes. It is NOT
+# chroot-clean by design — run `makepkg -si` from this `packaging/` directory.
+# For a reproducible/chroot build, switch to a VCS (-git) or tarball source.
+
+pkgname=filewall
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Synchronous, object-centric prompting for sensitive file access (fanotify)"
+arch=('x86_64')
+url="https://github.com/openslopware/filewall"
+license=('MIT')
+depends=('yad' 'gcc-libs')
+makedepends=('cargo')
+backup=('etc/filewall/config.toml')
+install="filewall.install"
+# Working-tree build: no source array; build() operates on the repo at $startdir/..
+source=()
+sha256sums=()
+
+# The repository root, relative to this PKGBUILD (packaging/PKGBUILD -> repo root).
+_repo() { realpath "$startdir/.."; }
+
+build() {
+  cd "$(_repo)"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$(_repo)/target"
+  cargo build --release --locked
+}
+
+check() {
+  cd "$(_repo)"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$(_repo)/target"
+  cargo test --release --locked
+}
+
+package() {
+  cd "$(_repo)"
+  local rel="target/release"
+
+  # Binaries.
+  install -Dm755 "$rel/filewalld"   "$pkgdir/usr/bin/filewalld"
+  install -Dm755 "$rel/filewall-ui" "$pkgdir/usr/bin/filewall-ui"
+  install -Dm755 "$rel/filewallctl" "$pkgdir/usr/bin/filewallctl"
+
+  # systemd units: filewalld is system-wide, filewall-ui is per-user.
+  install -Dm644 packaging/systemd/filewalld.service \
+    "$pkgdir/usr/lib/systemd/system/filewalld.service"
+  install -Dm644 packaging/systemd/filewall-ui.service \
+    "$pkgdir/usr/lib/systemd/user/filewall-ui.service"
+
+  # Default config (commented template; preserved across upgrades via backup=()).
+  install -Dm644 packaging/config.toml "$pkgdir/etc/filewall/config.toml"
+
+  # Docs: the fully-documented example config and the README.
+  install -Dm644 example_config.toml \
+    "$pkgdir/usr/share/doc/$pkgname/example_config.toml"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+
+  # MIT requires shipping the license text. Install it if the repo provides one;
+  # otherwise namcap will warn and a LICENSE file should be added to the repo.
+  if [ -f LICENSE ]; then
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  fi
+}

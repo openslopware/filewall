@@ -1,0 +1,38 @@
+[Unit]
+Description=filewall fanotify access-control daemon
+After=local-fs.target
+# The per-user UI rendezvouses over the socket via its own reconnect loop;
+# a system unit cannot (and need not) order against a --user unit.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/filewalld /etc/filewall/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# systemd creates/owns these root:root; the daemon's defaults point here
+# (socket + pidfile in /run/filewall, rules.toml in /var/lib/filewall).
+RuntimeDirectory=filewall
+RuntimeDirectoryMode=0755
+StateDirectory=filewall
+StateDirectoryMode=0755
+
+# fanotify-safe hardening only. Directives that build a private MOUNT namespace
+# (ProtectSystem, ProtectHome, PrivateTmp, ProtectProc, ProtectKernelTunables,
+# ProtectControlGroups, PrivateMounts) are DELIBERATELY OMITTED: the daemon must
+# see the host's whole filesystem to place marks (ProtectHome would hide /home and
+# silently leave those watches unmarked) and read every process's /proc entry
+# (ProtectProc would break exe/cmdline resolution). The directives below are
+# seccomp/cap-based and create no mount namespace, so they cannot perturb fanotify.
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectClock=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

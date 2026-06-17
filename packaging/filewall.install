@@ -1,0 +1,51 @@
+post_install() {
+  cat <<'EOF'
+==> filewall installed.
+
+  1. Edit /etc/filewall/config.toml and add [[watch]] blocks.
+     IMPORTANT: paths resolve as ROOT, so use ABSOLUTE paths
+     (e.g. /home/<you>/.ssh), NOT ~ (which would be /root).
+
+  2. Enable the system daemon:
+       sudo systemctl enable --now filewalld.service
+
+  3. Enable the per-user prompt UI in your graphical session:
+       systemctl --user enable --now filewall-ui.service
+
+  Fail-closed: filewalld marks files at startup. Until filewall-ui is running
+  and connected, any access that would prompt is DENIED.
+
+  Large trees: if 'journalctl -u filewalld' shows mark/watch-limit warnings,
+  raise the kernel limits, e.g.:
+       printf 'fs.fanotify.max_user_marks = 65536\nfs.inotify.max_user_watches = 524288\n' \
+         | sudo tee /etc/sysctl.d/50-filewall.conf
+       sudo sysctl --system
+
+  A fully-documented example lives at
+  /usr/share/doc/filewall/example_config.toml
+EOF
+}
+
+post_upgrade() {
+  cat <<'EOF'
+==> filewall upgraded.
+
+  Apply the new daemon binary:
+       sudo systemctl restart filewalld.service
+  And the new UI helper, in your session:
+       systemctl --user restart filewall-ui.service
+
+  Your /etc/filewall/config.toml was preserved; compare with any
+  /etc/filewall/config.toml.pacnew for new options.
+EOF
+}
+
+post_remove() {
+  cat <<'EOF'
+==> filewall removed.
+
+  Runtime state was left in place; remove it manually if desired:
+       sudo rm -rf /var/lib/filewall   # learned rules (rules.toml)
+  (/run/filewall is tmpfs and clears on reboot.)
+EOF
+}

@@ -1,3 +1,9 @@
 /target
 phase0/spike
 Cargo.lock
+
+# makepkg build artifacts (packaging/PKGBUILD builds the working tree)
+packaging/pkg/
+packaging/src/
+packaging/*.pkg.tar.*
+packaging/*.log
