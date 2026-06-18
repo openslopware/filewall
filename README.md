@@ -2,6 +2,8 @@
 
 Synchronous, object-centric prompting for sensitive file access on Linux.
 
+![Screenshot](docs/screenshot.png)
+
 When an unknown binary tries to `open()` a watched file (e.g. `~/.ssh/id_ed25519`),
 the kernel **blocks the syscall** and a desktop prompt asks you to allow or deny it
 in real time. This mitigates supply-chain attacks (malicious npm/pip/cargo
