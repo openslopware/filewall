@@ -24,7 +24,8 @@ primitive that synchronously blocks a syscall pending a userspace decision.
 | Crate / binary | Privilege | Role |
 |----------------|-----------|------|
 | `filewalld`      | root (`CAP_SYS_ADMIN`) | Marks watched paths (single files directly; directories via `FAN_EVENT_ON_CHILD`, so new files and atomically-renamed files are covered automatically and new subdirs are live-marked via inotify), evaluates accesses against the allowlist **and learned rules**, asks the UI on a miss, persists "Always" decisions, answers the kernel. |
-| `filewall-ui`    | user session | Renders the scope-aware **yad** prompt — showing whether an "Always" rule will cover one file or a whole tree — and returns the decision. |
+| `filewall-ui-iced` | user session | **Default UI.** Renders the scope-aware prompt natively (iced, software-rendered) — showing whether an "Always" rule will cover one file or a whole tree — and returns the decision. No external GUI dependency. |
+| `filewall-ui`    | user session | Alternative UI that renders the same prompt via the external **yad** dialog. Mutually exclusive with `filewall-ui-iced` (only one may hold the daemon's prompt socket). |
 | `filewallctl`    | user (root for live paths) | Lists/removes learned rules; reloads (`SIGHUP`) and reports daemon status. |
 | `filewall-proto` | library | Shared length-prefixed-JSON IPC types. |
 | `filewall-rules` | library | Learned-rule schema, atomic `rules.toml` store, deny-wins matcher (shared by daemon + ctl). |
@@ -56,7 +57,7 @@ point of the split — root can't (and shouldn't) pop a dialog into your session
 
 **Startup & fail-closed.** The daemon places its marks **immediately at startup**,
 before any UI has connected — so guarded files are protected from the moment
-`filewalld` is running (e.g. at boot, before anyone logs in). While no `filewall-ui`
+`filewalld` is running (e.g. at boot, before anyone logs in). While no UI
 is connected, any access that *would* prompt is **denied** (fail-closed); the daemon
 picks up the UI the moment it connects (it keeps listening and re-accepts a dropped
 link non-blockingly). On a packaged install the system daemon starts at boot and the
@@ -73,11 +74,13 @@ learned rules are never auto-generalized into globs.
 - **Rust** (stable) with `cargo` — to build the workspace.
 - **Linux with fanotify permission events.** `filewalld` runs as root
   (`CAP_SYS_ADMIN`); `FAN_OPEN_PERM` is a Linux-only primitive.
-- **[`yad`](https://github.com/v1cont/yad)** — the GTK dialog tool that
-  `filewall-ui` shells out to for the access prompt. Install it before running
-  the UI: `sudo pacman -S yad` (Arch) · `sudo apt install yad` (Debian/Ubuntu).
-  If `yad` is missing the UI cannot render a prompt, so **every prompt fails
-  closed (denied)**.
+- **A graphical session.** The default UI (`filewall-ui-iced`) renders natively
+  and needs no external dialog tool — only the usual session libraries (`libxkbcommon`,
+  plus `wayland` or `libx11` for your session type). If the UI can't reach a display
+  it **fails closed (denied)**.
+- **[`yad`](https://github.com/v1cont/yad)** — *only* for the alternative
+  `filewall-ui` (yad) variant: `sudo pacman -S yad` (Arch) · `sudo apt install yad`
+  (Debian/Ubuntu). Not needed for the default native UI.
 
 ## Build & test
 
@@ -97,10 +100,10 @@ which is convenient for iterating but not chroot-clean:
 
 ```sh
 cd packaging
-makepkg -si        # build + install filewall, plus its yad dependency
+makepkg -si        # build + install filewall (native UI; yad is an optdepend)
 ```
 
-This installs the three binaries to `/usr/bin/`, the config template to
+This installs the binaries to `/usr/bin/`, the config template to
 `/etc/filewall/config.toml` (a pacman `backup` file — your edits survive upgrades,
 new options arrive as `.pacnew`), and the units below.
 
@@ -115,15 +118,17 @@ sudoedit /etc/filewall/config.toml
 # 2. Start the privileged daemon (system-wide, runs as root):
 sudo systemctl enable --now filewalld.service
 
-# 3. Start the prompt UI in your graphical session (per-user):
-systemctl --user enable --now filewall-ui.service
+# 3. Start the prompt UI in your graphical session (per-user, native default):
+systemctl --user enable --now filewall-ui-iced.service
+#    ...or the yad-based UI instead (never both — they Conflict=):
+#    systemctl --user enable --now filewall-ui.service
 ```
 
 The daemon's `RuntimeDirectory`/`StateDirectory` provide `/run/filewall` (socket +
 pidfile) and `/var/lib/filewall` (learned `rules.toml`) automatically.
 
 > **Bare window managers:** if your WM doesn't import the session environment into
-> the systemd user manager, `filewall-ui` won't see `$DISPLAY`/`$WAYLAND_DISPLAY`.
+> the systemd user manager, the prompt UI won't see `$DISPLAY`/`$WAYLAND_DISPLAY`.
 > Add to your session startup (e.g. `~/.xinitrc`):
 > `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS`.
 > A missing display degrades safely — the UI fails closed (deny).
@@ -166,11 +171,15 @@ Glob semantics: `*` does not cross `/`; `**` does.
 > watches, so the daemon starts clean and guards nothing until you opt in.
 
 Run the daemon (dev): `sudo ./target/release/filewalld /path/to/config.toml`
-Run the UI (dev):     `./target/release/filewall-ui`
+Run the UI (dev):     `./target/release/filewall-ui-iced`
 
-> Needs **`yad`** in the session (see [Prerequisites](#prerequisites)); the
-> prompt is rendered with markup so a broad (whole-tree) "Always allow" grant is
-> visually distinct from a single-file one.
+> The native UI needs a graphical session but no external dialog tool, and follows
+> the desktop's light/dark preference (read from xdg-desktop-portal's
+> `org.freedesktop.appearance` `color-scheme`). A broad (whole-tree) "Always allow"
+> grant is shown with a prominent red warning so it is visually distinct from a
+> single-file one. Pass `--demo` to preview the prompt without a running daemon. The
+> yad variant (`./target/release/filewall-ui`) is an alternative that instead needs
+> **`yad`** in the session.
 
 For a packaged install that runs both as managed services, see
 [Installation](#installation).
@@ -194,7 +203,8 @@ Core daemon/UI:
   link over one global `0o666` socket, so it serves **one interactive user at a
   time** — fast-user-switching / multi-seat is not supported.
 - privilege drop after init (the daemon stays root for its lifetime).
-- `notify-send` UI variant (currently `yad`-only).
+- `notify-send` UI variant (the UI ships as a native `filewall-ui-iced` and a
+  `yad`-based `filewall-ui`; a lightweight `notify-send` variant is still deferred).
 
 Packaging (recommended follow-ups identified while adding the systemd/PKGBUILD support):
 - **Tighten the daemon unit's sandbox.** `packaging/systemd/filewalld.service`

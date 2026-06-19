@@ -16,8 +16,13 @@ in real time to allow/deny — and "Always" decisions now persist as learned rul
   server, event loop. Consults config globs **and** learned rules (deny-wins),
   persists "Always" decisions, captures process `cwd`, reloads config+rules on
   `SIGHUP`, writes a pidfile.
-- `filewall-ui` (user session) — 4-button yad prompt (Allow/Deny once,
-  Always allow/deny), scope-aware (file vs whole-tree), shows cwd, fail-closed.
+- `filewall-ui-iced` (user session) — **default UI**: native iced (software-rendered,
+  no external dialog tool) 4-button prompt (Allow/Deny once, Always allow/deny),
+  scope-aware (file vs whole-tree), shows cwd, fail-closed (Esc/Enter/close/timeout →
+  deny), strict self-timeout from the daemon's new `ui_timeout_ms`, follows the
+  desktop light/dark preference (xdg-desktop-portal `color-scheme`). `--demo` preview.
+- `filewall-ui` (user session) — alternative yad-based prompt, same 4 buttons and
+  scope-awareness; mutually exclusive with the iced UI (one prompt socket).
 - `filewallctl` — list / remove / reload (SIGHUP) / status for learned rules.
 - Per-inode marking; watchdog timeout → deny; pidfd-based race-free resolution.
 - **Marks placed at startup, before any UI connects** — guarded files are protected
@@ -27,11 +32,13 @@ in real time to allow/deny — and "Always" decisions now persist as learned rul
   the event loop (deny while disconnected, fail-closed), so the daemon survives a
   UI restart instead of breaking until a daemon restart.
 - Packaging (`packaging/`): system unit `filewalld.service` (root, fanotify-safe
-  hardening, `RuntimeDirectory`/`StateDirectory`), per-user unit
-  `filewall-ui.service` (`graphical-session.target`), commented `/etc/filewall/
+  hardening, `RuntimeDirectory`/`StateDirectory`), per-user units
+  `filewall-ui-iced.service` (default) and `filewall-ui.service`
+  (`graphical-session.target`, `Conflicts=` each other), commented `/etc/filewall/
   config.toml` template (pacman `backup`), local working-tree `PKGBUILD` +
-  `.install` scriptlet, and an MIT `LICENSE`.
-- 69 tests pass; Phase 0 spike (`phase0/`) validated fanotify on this kernel.
+  `.install` scriptlet, and an MIT `LICENSE`. The `.install`/PKGBUILD default the
+  enabled UI to `filewall-ui-iced`; `yad` is an optdepend for the alternative.
+- 78 tests pass; Phase 0 spike (`phase0/`) validated fanotify on this kernel.
 
 ## Verified
 - Phase 0 spike: per-inode perm events fire, block, gate the open; deny → EPERM.
