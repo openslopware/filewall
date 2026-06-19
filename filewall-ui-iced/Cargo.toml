@@ -1,0 +1,21 @@
+[package]
+name = "filewall-ui-iced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "filewall-ui-iced"
+path = "src/main.rs"
+
+[dependencies]
+filewall-proto.workspace = true
+# Software renderer (tiny-skia): no wgpu/GPU dependency, works on minimal/headless
+# boxes. `fira-sans` bundles the default font so text renders without a system one.
+# `smol` selects a lightweight async executor so `iced::time::every` (the
+# countdown timer) is available without pulling in tokio.
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "fira-sans", "smol"] }
+# Read the user's light/dark preference from xdg-desktop-portal
+# (org.freedesktop.portal.Settings) to pick the prompt's theme.
+zbus = "5"

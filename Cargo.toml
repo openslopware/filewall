@@ -5,6 +5,7 @@ members = [
   "filewall-rules",
   "filewalld",
   "filewall-ui",
+  "filewall-ui-iced",
   "filewallctl",
 ]
 
