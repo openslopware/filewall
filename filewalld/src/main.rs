@@ -29,6 +29,12 @@ const PIDFILE: &str = "/run/filewall/filewalld.pid";
 /// interrupt a blocking `read()`, so this bounds worst-case hot-reload latency.
 const RELOAD_POLL_MS: libc::c_int = 500;
 
+/// Headroom subtracted from `prompt_timeout` when telling the UI how long it has
+/// to answer ([`PromptRequest::ui_timeout_ms`]). The UI must auto-deny *before*
+/// the daemon's socket read times out, leaving time for the reply to travel back;
+/// 5 s comfortably covers transit + the UI's write.
+const UI_TIMEOUT_MARGIN_MS: u32 = 5_000;
+
 pub(crate) static RELOAD: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sighup(_sig: libc::c_int) {
@@ -64,6 +70,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(Path::new(&config_path))?;
     let mut policy = cfg.build_policy()?;
     let timeout = Duration::from_secs(cfg.prompt_timeout_seconds);
+    // How long a UI gets to answer: the daemon's prompt timeout minus headroom,
+    // floored at 2 s so a tiny configured timeout still yields a usable window.
+    let ui_timeout_ms = cfg
+        .prompt_timeout_seconds
+        .saturating_mul(1000)
+        .saturating_sub(UI_TIMEOUT_MARGIN_MS as u64)
+        .clamp(2_000, u32::MAX as u64) as u32;
     let own_pid = std::process::id();
 
     let rules_path = cfg.rules_path.clone();
@@ -115,7 +128,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop(
         &fan, &mut policy, &mut rules, &rules_path, &config_path, &server, &mut ui,
-        &mut treewatch, own_pid,
+        &mut treewatch, own_pid, ui_timeout_ms,
     )
 }
 
@@ -205,6 +218,7 @@ fn event_loop(
     ui: &mut Option<UiLink>,
     treewatch: &mut treewatch::TreeWatch,
     own_pid: u32,
+    ui_timeout_ms: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // Poll the fanotify fd and the treewatch inotify fd together. A bounded
@@ -323,6 +337,7 @@ fn event_loop(
                         always_object,
                         always_tree,
                         always_cwd_pinned,
+                        ui_timeout_ms,
                     };
                     // Recover a dropped link without blocking the event loop.
                     if ui.is_none() {

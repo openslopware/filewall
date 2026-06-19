@@ -259,6 +259,7 @@ mod tests {
             always_object: "/home/u/.ssh".into(),
             always_tree: true,
             always_cwd_pinned: false,
+            ui_timeout_ms: 0,
         }
     }
 

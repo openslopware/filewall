@@ -28,6 +28,13 @@ pub struct PromptRequest {
     pub always_tree: bool,
     /// True when the rule is pinned to the process's current cwd.
     pub always_cwd_pinned: bool,
+    /// Milliseconds the UI has to answer before it must auto-deny, kept strictly
+    /// below the daemon's `prompt_timeout` so a late click can never be mis-read
+    /// as the answer to the *next* access (the protocol has no correlation id).
+    /// `0` = unset (a UI falls back to its own built-in default). The yad helper
+    /// ignores this field; `filewall-ui-iced` uses it to arm a self-timeout.
+    #[serde(default)]
+    pub ui_timeout_ms: u32,
 }
 
 /// The user's decision for a single access. `*Once` are one-shot; `*Always`
@@ -102,6 +109,7 @@ mod tests {
             always_object: "/home/user/.ssh".into(),
             always_tree: true,
             always_cwd_pinned: false,
+            ui_timeout_ms: 25_000,
         }
     }
 
