@@ -14,9 +14,7 @@ mod worker;
 use filewall_proto::{Decision, PromptRequest};
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::widget::{button, column, container, row, text, Space};
-use iced::{
-    event, keyboard, stream, time, window, Color, Element, Font, Length, Subscription, Task,
-};
+use iced::{event, keyboard, stream, time, window, Element, Font, Length, Subscription, Task};
 use model::{PromptView, Scope};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -232,12 +230,13 @@ impl App {
             weight: iced::font::Weight::Bold,
             ..Font::DEFAULT
         };
-        let danger = Color::from_rgb(0.90, 0.50, 0.50);
-        let muted = Color::from_rgb(0.45, 0.45, 0.45);
+        // Use the theme's predefined `danger` accent (Catppuccin), not a custom
+        // color. Untinted text falls back to the theme's default text color.
+        let danger = self.theme.extended_palette().danger.base.color;
 
         // Portable glyphs only: the bundled Fira Sans lacks ⚠/「」, which would
         // render as tofu boxes on a security prompt. Emphasis comes from bold +
-        // size + the red scope warning, not exotic symbols.
+        // size + the danger-colored scope warning, not exotic symbols.
         let header = text("filewall \u{2014} sensitive file access")
             .font(bold)
             .size(18)
@@ -277,17 +276,12 @@ impl App {
         ]
         .spacing(2);
         if v.cwd_pinned {
-            tied = tied
-                .push(text(format!("\u{2026}and only while it runs from {}", v.cwd)).color(muted));
+            tied = tied.push(text(format!("\u{2026}and only while it runs from {}", v.cwd)));
         }
 
-        let meta = text(format!("PID {} \u{00B7} cmd: {}", v.pid, v.cmdline))
-            .size(12)
-            .color(muted);
+        let meta = text(format!("PID {} \u{00B7} cmd: {}", v.pid, v.cmdline)).size(12);
 
-        let countdown = text(format!("auto-deny in {}s", p.remaining_s))
-            .size(12)
-            .color(muted);
+        let countdown = text(format!("auto-deny in {}s", p.remaining_s)).size(12);
 
         // Button order mirrors the yad rule: safe "Deny once" first; the broad
         // "Always allow ALL" last (hardest to hit by accident). Enter/Escape also

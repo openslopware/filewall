@@ -24,7 +24,7 @@ const KEY: &str = "color-scheme";
 
 /// Theme used when the preference can't be read (no portal / headless). The
 /// freedesktop convention treats "no preference" as light.
-pub const FALLBACK: Theme = Theme::Light;
+pub const FALLBACK: Theme = Theme::CatppuccinLatte;
 
 /// Open a session-bus connection for reading the portal. `None` if there is no
 /// session bus (e.g. headless); the caller then uses [`FALLBACK`]. Reused across
@@ -38,12 +38,13 @@ pub fn detect(conn: &Connection) -> Option<Theme> {
     read_scheme(conn).map(theme_from_scheme)
 }
 
-/// Map the portal's `color-scheme` value to a theme. `1` → dark, `2` → light,
-/// anything else (no preference / unknown) → [`FALLBACK`].
+/// Map the portal's `color-scheme` value to a theme. `1` (prefer dark) →
+/// Catppuccin Mocha, `2` (prefer light) → Catppuccin Latte, anything else (no
+/// preference / unknown) → [`FALLBACK`].
 pub fn theme_from_scheme(scheme: u32) -> Theme {
     match scheme {
-        1 => Theme::Dark,
-        2 => Theme::Light,
+        1 => Theme::CatppuccinMocha,
+        2 => Theme::CatppuccinLatte,
         _ => FALLBACK,
     }
 }
@@ -84,9 +85,9 @@ mod tests {
 
     #[test]
     fn scheme_mapping() {
-        assert_eq!(theme_from_scheme(1), Theme::Dark);
-        assert_eq!(theme_from_scheme(2), Theme::Light);
-        // No preference / unknown values use the fallback.
+        assert_eq!(theme_from_scheme(1), Theme::CatppuccinMocha);
+        assert_eq!(theme_from_scheme(2), Theme::CatppuccinLatte);
+        // No preference / unknown values use the fallback (Catppuccin Latte).
         assert_eq!(theme_from_scheme(0), FALLBACK);
         assert_eq!(theme_from_scheme(99), FALLBACK);
     }
