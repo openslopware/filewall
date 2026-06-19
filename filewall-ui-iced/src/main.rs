@@ -56,7 +56,11 @@ fn main() -> iced::Result {
     }
 
     CONFIG
-        .set(WorkerConfig { socket, fallback_ms, demo })
+        .set(WorkerConfig {
+            socket,
+            fallback_ms,
+            demo,
+        })
         .ok()
         .expect("CONFIG set once");
 
@@ -178,7 +182,10 @@ impl App {
                 let effective_ms = if req.ui_timeout_ms > 0 {
                     req.ui_timeout_ms
                 } else {
-                    CONFIG.get().map(|c| c.fallback_ms).unwrap_or(DEFAULT_FALLBACK_MS)
+                    CONFIG
+                        .get()
+                        .map(|c| c.fallback_ms)
+                        .unwrap_or(DEFAULT_FALLBACK_MS)
                 };
                 let deadline = Instant::now() + Duration::from_millis(effective_ms as u64);
                 self.pending = Some(Pending {
@@ -221,8 +228,11 @@ impl App {
             return text("").into();
         };
         let v = &p.view;
-        let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
-        let danger = Color::from_rgb(0.80, 0.0, 0.0);
+        let bold = Font {
+            weight: iced::font::Weight::Bold,
+            ..Font::DEFAULT
+        };
+        let danger = Color::from_rgb(0.90, 0.50, 0.50);
         let muted = Color::from_rgb(0.45, 0.45, 0.45);
 
         // Portable glyphs only: the bundled Fira Sans lacks ⚠/「」, which would
@@ -267,9 +277,8 @@ impl App {
         ]
         .spacing(2);
         if v.cwd_pinned {
-            tied = tied.push(
-                text(format!("\u{2026}and only while it runs from {}", v.cwd)).color(muted),
-            );
+            tied = tied
+                .push(text(format!("\u{2026}and only while it runs from {}", v.cwd)).color(muted));
         }
 
         let meta = text(format!("PID {} \u{00B7} cmd: {}", v.pid, v.cmdline))
@@ -327,9 +336,7 @@ impl App {
                 event::Event::Window(window::Event::CloseRequested) => Some(Message::Deny),
                 event::Event::Keyboard(keyboard::Event::KeyPressed {
                     key:
-                        keyboard::Key::Named(
-                            keyboard::key::Named::Escape | keyboard::key::Named::Enter,
-                        ),
+                        keyboard::Key::Named(keyboard::key::Named::Escape | keyboard::key::Named::Enter),
                     ..
                 }) => Some(Message::Deny),
                 _ => None,
