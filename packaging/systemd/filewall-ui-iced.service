@@ -1,0 +1,23 @@
+[Unit]
+Description=filewall access-prompt UI helper (native/iced, experimental)
+After=graphical-session.target
+PartOf=graphical-session.target
+# Only one UI may hold the daemon's single prompt socket. Enabling this unit
+# stops the yad helper (and vice versa); never run both.
+Conflicts=filewall-ui.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/filewall-ui-iced
+Restart=on-failure
+RestartSec=2
+# Needs the session's DISPLAY/WAYLAND_DISPLAY (+ XAUTHORITY on X11). On a
+# systemd-managed graphical session the DE imports these into the user manager's
+# environment, carried by graphical-session.target. Bare WMs that don't import
+# session env need, typically from ~/.xinitrc:
+#   systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS
+# Fails closed (DenyOnce) if iced can't initialize, so a missing display degrades
+# safely rather than granting access.
+
+[Install]
+WantedBy=graphical-session.target

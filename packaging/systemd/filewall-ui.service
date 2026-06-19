@@ -2,6 +2,9 @@
 Description=filewall access-prompt UI helper
 After=graphical-session.target
 PartOf=graphical-session.target
+# Only one UI may hold the daemon's single prompt socket; enabling the iced
+# helper stops this one (and vice versa).
+Conflicts=filewall-ui-iced.service
 
 [Service]
 Type=simple

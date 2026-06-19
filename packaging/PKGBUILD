@@ -6,14 +6,18 @@
 # For a reproducible/chroot build, switch to a VCS (-git) or tarball source.
 
 pkgname=filewall
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Synchronous, object-centric prompting for sensitive file access (fanotify)"
 arch=('x86_64')
 url="https://github.com/openslopware/filewall"
 license=('MIT')
-depends=('yad' 'gcc-libs')
+# The default UI is the native filewall-ui-iced; winit always needs libxkbcommon.
+depends=('gcc-libs' 'libxkbcommon')
 makedepends=('cargo')
+optdepends=('wayland: native UI (filewall-ui-iced, default) on Wayland sessions'
+  'libx11: native UI (filewall-ui-iced, default) on X11 sessions'
+  'yad: alternative prompt UI (filewall-ui) — enable filewall-ui.service instead')
 backup=('etc/filewall/config.toml')
 install="filewall.install"
 # Working-tree build: no source array; build() operates on the repo at $startdir/..
@@ -42,15 +46,21 @@ package() {
   local rel="target/release"
 
   # Binaries.
-  install -Dm755 "$rel/filewalld"   "$pkgdir/usr/bin/filewalld"
+  install -Dm755 "$rel/filewalld" "$pkgdir/usr/bin/filewalld"
   install -Dm755 "$rel/filewall-ui" "$pkgdir/usr/bin/filewall-ui"
+  install -Dm755 "$rel/filewall-ui-iced" "$pkgdir/usr/bin/filewall-ui-iced"
   install -Dm755 "$rel/filewallctl" "$pkgdir/usr/bin/filewallctl"
 
-  # systemd units: filewalld is system-wide, filewall-ui is per-user.
+  # systemd units: filewalld is system-wide, the UI helpers are per-user. The two
+  # UI units Conflict= each other (only one may hold the daemon's prompt socket);
+  # enable exactly one with `systemctl --user enable --now <unit>`. The native
+  # filewall-ui-iced is the default; filewall-ui (yad) is the alternative.
   install -Dm644 packaging/systemd/filewalld.service \
     "$pkgdir/usr/lib/systemd/system/filewalld.service"
   install -Dm644 packaging/systemd/filewall-ui.service \
     "$pkgdir/usr/lib/systemd/user/filewall-ui.service"
+  install -Dm644 packaging/systemd/filewall-ui-iced.service \
+    "$pkgdir/usr/lib/systemd/user/filewall-ui-iced.service"
 
   # Default config (commented template; preserved across upgrades via backup=()).
   install -Dm644 packaging/config.toml "$pkgdir/etc/filewall/config.toml"

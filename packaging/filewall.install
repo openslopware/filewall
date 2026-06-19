@@ -9,10 +9,12 @@ post_install() {
   2. Enable the system daemon:
        sudo systemctl enable --now filewalld.service
 
-  3. Enable the per-user prompt UI in your graphical session:
-       systemctl --user enable --now filewall-ui.service
+  3. Enable the per-user prompt UI in your graphical session (native, default):
+       systemctl --user enable --now filewall-ui-iced.service
+     Prefer the yad-based UI? Enable filewall-ui.service instead — never both
+     (they Conflict= for the daemon's single prompt socket).
 
-  Fail-closed: filewalld marks files at startup. Until filewall-ui is running
+  Fail-closed: filewalld marks files at startup. Until a prompt UI is running
   and connected, any access that would prompt is DENIED.
 
   Large trees: if 'journalctl -u filewalld' shows mark/watch-limit warnings,
@@ -32,8 +34,8 @@ post_upgrade() {
 
   Apply the new daemon binary:
        sudo systemctl restart filewalld.service
-  And the new UI helper, in your session:
-       systemctl --user restart filewall-ui.service
+  And the new UI helper, in your session (whichever you enabled):
+       systemctl --user restart filewall-ui-iced.service   # or filewall-ui.service
 
   Your /etc/filewall/config.toml was preserved; compare with any
   /etc/filewall/config.toml.pacnew for new options.
