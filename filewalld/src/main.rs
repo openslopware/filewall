@@ -339,21 +339,11 @@ fn event_loop(
                         always_cwd_pinned,
                         ui_timeout_ms,
                     };
-                    // Recover a dropped link without blocking the event loop.
-                    if ui.is_none() {
-                        match server.try_accept() {
-                            Ok(Some(link)) => {
-                                *ui = Some(link);
-                                info!("UI reconnected");
-                            }
-                            Ok(None) => {}
-                            Err(e) => warn!("try_accept failed: {e}"),
-                        }
-                    }
-                    // Borrow ends with the result; lets us reassign `ui` below.
-                    let result = ui.as_mut().map(|link| link.prompt(&req));
-                    match result {
-                        Some(Ok(decision)) => {
+                    // Prompt the UI, recovering a link left stale by a UI restart:
+                    // re-accept a waiting UI and retry once before denying, so the
+                    // first access after a restart prompts instead of being denied.
+                    match server.prompt_recovering(ui, &req) {
+                        Ok(decision) => {
                             // Persist "Always": add in-memory now, mirror to disk.
                             if let Some(action) = always_action(decision) {
                                 if let Some(watch) = covering_watch {
@@ -369,24 +359,23 @@ fn event_loop(
                             }
                             decision.allows()
                         }
-                        // Dead connection -> deny this access and drop the link so a
-                        // restarted UI is picked up on the next prompt.
-                        Some(Err(e)) if is_disconnect(&e) => {
+                        // Dead connection (even after the retry) -> deny; `ui` was
+                        // already cleared so a later access re-accepts.
+                        Err(e) if is_disconnect(&e) => {
                             warn!(
                                 "UI disconnected ({e}); denying {} and awaiting reconnect",
                                 path.display()
                             );
-                            *ui = None;
-                            false
-                        }
-                        // Timeout / transient -> deny (watchdog), keep the link.
-                        Some(Err(e)) => {
-                            warn!("prompt failed ({e}); denying {} for {}", path.display(), exe);
                             false
                         }
                         // No UI connected right now -> deny (fail-closed).
-                        None => {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
                             warn!("no UI connected; denying {} for {}", path.display(), exe);
+                            false
+                        }
+                        // Timeout / transient -> deny (watchdog), keep the link.
+                        Err(e) => {
+                            warn!("prompt failed ({e}); denying {} for {}", path.display(), exe);
                             false
                         }
                     }

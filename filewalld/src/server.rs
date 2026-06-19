@@ -69,6 +69,58 @@ impl UiServer {
             Err(e) => Err(e),
         }
     }
+
+    /// Prompt the connected UI, recovering a *stale* link in place.
+    ///
+    /// A link held from an earlier prompt may have died while idle (e.g. the UI
+    /// was restarted); the daemon only learns this when the write fails. So:
+    /// ensure a link (accepting a waiting UI non-blockingly), try once, and on a
+    /// **disconnect** drop it, pick up a freshly-connected UI if one is waiting,
+    /// and retry **once**. This way the first access after a UI restart prompts
+    /// instead of being denied. `*ui` is left `None` after an unrecoverable
+    /// disconnect, so a later access re-accepts.
+    ///
+    /// Errors the caller denies on: a read timeout (watchdog) — the link is kept;
+    /// `NotConnected` — no UI is available right now; or a still-dead link after
+    /// the retry. The retry is bounded to one attempt, so this never blocks the
+    /// event loop on a flapping peer.
+    pub fn prompt_recovering(
+        &self,
+        ui: &mut Option<UiLink>,
+        req: &PromptRequest,
+    ) -> io::Result<Decision> {
+        // Ensure we hold a link (cold start, or after a previous disconnect).
+        if ui.is_none() {
+            *ui = self.try_accept()?;
+        }
+        // First attempt. A disconnect means the held link was stale: drop it and
+        // fall through to one reconnect+retry. A timeout/transient error keeps the
+        // link (the watchdog) and is returned for the caller to deny.
+        if let Some(link) = ui.as_mut() {
+            match link.prompt(req) {
+                Ok(d) => return Ok(d),
+                Err(e) if is_disconnect(&e) => {
+                    log::info!("held UI link was stale ({e}); reconnecting for this access");
+                    *ui = None;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Pick up a freshly-connected UI (the restarted process) and retry once.
+        if ui.is_none() {
+            *ui = self.try_accept()?;
+        }
+        match ui.as_mut() {
+            Some(link) => {
+                let r = link.prompt(req);
+                if matches!(&r, Err(e) if is_disconnect(e)) {
+                    *ui = None; // still dead after retry: re-accept next time
+                }
+                r
+            }
+            None => Err(io::Error::new(io::ErrorKind::NotConnected, "no UI connected")),
+        }
+    }
 }
 
 /// Whether an error from [`UiLink::prompt`] means the connection is dead (and the
@@ -229,6 +281,49 @@ mod tests {
         let mut link = try_accept_with_retry(&server);
         assert_eq!(link.prompt(&sample_req()).unwrap(), Decision::DenyOnce);
         client.join().unwrap();
+    }
+
+    #[test]
+    fn prompt_recovering_picks_up_new_ui_after_stale_link() {
+        // Reproduces the "first access after a UI restart" case: the daemon holds
+        // a link to a UI that has since died; a replacement UI is connected. The
+        // first prompt must recover onto the new UI rather than denying.
+        let sock = temp_sock("recover-stale");
+        let server = UiServer::bind(&sock, Duration::from_secs(5)).unwrap();
+
+        // UI #1 connects and is accepted as the daemon's held link, then dies
+        // (the pre-restart process).
+        let sock2 = sock.clone();
+        let c1 = thread::spawn(move || {
+            let c = UnixStream::connect(&sock2).unwrap();
+            drop(c);
+        });
+        let mut ui = Some(try_accept_with_retry(&server));
+        c1.join().unwrap();
+
+        // UI #2 (the restarted process) connects and will answer one prompt.
+        let sock3 = sock.clone();
+        let c2 = thread::spawn(move || {
+            let mut c = UnixStream::connect(&sock3).unwrap();
+            let _req: PromptRequest = read_msg(&mut c).unwrap();
+            write_msg(&mut c, &PromptResponse { decision: Decision::AllowOnce }).unwrap();
+        });
+
+        // A single access: prompt_recovering drops the stale link, accepts #2, and
+        // retries. The outer loop only covers the connect race (NotConnected until
+        // #2 lands in the backlog); the recovery itself is one call.
+        let decision = loop {
+            match server.prompt_recovering(&mut ui, &sample_req()) {
+                Ok(d) => break d,
+                Err(e) if e.kind() == io::ErrorKind::NotConnected => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("unexpected error from prompt_recovering: {e:?}"),
+            }
+        };
+        assert_eq!(decision, Decision::AllowOnce);
+        assert!(ui.is_some(), "the recovered link should be retained");
+        c2.join().unwrap();
     }
 
     #[test]
