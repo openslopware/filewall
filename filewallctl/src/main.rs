@@ -9,15 +9,23 @@
 mod format;
 mod render;
 
+use filewall_proto::{
+    read_msg_capped, write_msg_capped, ControlRequest, DumpResponse, MAX_CONTROL_MSG_LEN,
+};
 use filewall_rules::Rules;
+use format::Format;
 use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use std::io;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 const DEFAULT_RULES: &str = "/var/lib/filewall/rules.toml";
 const DEFAULT_PIDFILE: &str = "/run/filewall/filewalld.pid";
+const DEFAULT_CONTROL_SOCKET: &str = "/run/filewall/control.sock";
 
 fn parse_pidfile(s: &str) -> Option<i32> {
     s.trim().parse::<i32>().ok()
@@ -150,20 +158,123 @@ fn cmd_status(pidfile: &Path) -> ExitCode {
     }
 }
 
+/// Render a dump as an aligned table. `live` column: "yes"/"no" for dirs,
+/// "-" for files (not applicable). `fanotify` column flags coverage gaps.
+fn dump_table(resp: &DumpResponse) -> String {
+    let rows: Vec<Vec<String>> = resp
+        .objects
+        .iter()
+        .map(|o| {
+            let kind = match o.kind {
+                filewall_proto::ObjKind::File => "file",
+                filewall_proto::ObjKind::Dir => "dir",
+            };
+            let live = match o.live_marked {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "-",
+            };
+            vec![
+                o.path.clone(),
+                kind.to_string(),
+                if o.recursive { "yes" } else { "no" }.to_string(),
+                if o.fanotify { "yes" } else { "no" }.to_string(),
+                live.to_string(),
+                o.watch.clone(),
+            ]
+        })
+        .collect();
+    let mut out = render::render_table(
+        &["PATH", "KIND", "RECURSIVE", "FANOTIFY", "LIVE", "WATCH"],
+        &rows,
+    );
+    out.push_str(&format!("\n{} object(s) (pid {})\n", resp.objects.len(), resp.pid));
+    out
+}
+
+/// Connect to the control socket, request a dump, and return the response.
+fn fetch_dump(socket: &Path) -> io::Result<DumpResponse> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    write_msg_capped(&mut stream, &ControlRequest::Dump, MAX_CONTROL_MSG_LEN)?;
+    read_msg_capped(&mut stream, MAX_CONTROL_MSG_LEN)
+}
+
+fn cmd_dump(socket: &Path, format: Format) -> ExitCode {
+    match fetch_dump(socket) {
+        Ok(resp) => match format {
+            Format::Table => {
+                print!("{}", dump_table(&resp));
+                ExitCode::SUCCESS
+            }
+            _ => match render::emit(&resp, format) {
+                Ok(s) => {
+                    println!("{s}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("filewallctl: render failed: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
+        Err(e) => {
+            emit_error(
+                format,
+                &format!(
+                    "could not query daemon on {} ({e}); is filewalld running?",
+                    socket.display()
+                ),
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print an error in the chosen format: a plain stderr line for tables, a
+/// `{ "error": ... }` object for json/yaml (so automation can detect failure).
+fn emit_error(format: Format, msg: &str) {
+    match format {
+        Format::Table => eprintln!("filewallctl: {msg}"),
+        _ => {
+            #[derive(serde::Serialize)]
+            struct ErrorReport<'a> {
+                error: &'a str,
+            }
+            match render::emit(&ErrorReport { error: msg }, format) {
+                Ok(s) => eprintln!("{s}"),
+                Err(_) => eprintln!("filewallctl: {msg}"),
+            }
+        }
+    }
+}
+
 fn usage() -> ExitCode {
     eprintln!(
         "usage:\n  \
-         filewallctl list [rules_path]\n  \
-         filewallctl remove <index> [rules_path]\n  \
-         filewallctl reload [pidfile]\n  \
-         filewallctl status [pidfile]"
+         filewallctl [--json|--yaml|--table] <command>\n\n\
+         commands:\n  \
+         list   [rules_path]      Print learned rules\n  \
+         dump   [control_socket]  Print objects the daemon is protecting\n  \
+         remove <index> [path]    Remove a rule by index, then SIGHUP the daemon\n  \
+         reload [pidfile]         Send SIGHUP to the running daemon\n  \
+         status [pidfile]         Report whether the daemon is running"
     );
     ExitCode::FAILURE
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let (format, args) = format::parse_format(&raw);
     match args.first().map(String::as_str) {
+        Some("dump") => {
+            let socket = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET));
+            cmd_dump(&socket, format)
+        }
         Some("list") => {
             let path = args
                 .get(1)
@@ -257,6 +368,40 @@ mod tests {
             classify_liveness(Err(Errno::EINVAL)),
             Liveness::Unknown(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn dump_table_renders_objects_with_health() {
+        use filewall_proto::{DumpResponse, ObjKind, WatchedObject};
+        let resp = DumpResponse {
+            pid: 7,
+            generated_unix: 0,
+            objects: vec![
+                WatchedObject {
+                    path: "/home/u/.ssh".into(),
+                    kind: ObjKind::Dir,
+                    recursive: true,
+                    watch: "/home/u/.ssh".into(),
+                    fanotify: true,
+                    live_marked: Some(true),
+                },
+                WatchedObject {
+                    path: "/home/u/.vault-token".into(),
+                    kind: ObjKind::File,
+                    recursive: false,
+                    watch: "/home/u/.vault-token".into(),
+                    fanotify: true,
+                    live_marked: None,
+                },
+            ],
+        };
+        let out = super::dump_table(&resp);
+        assert!(out.contains("PATH"));
+        assert!(out.contains("/home/u/.ssh"));
+        assert!(out.contains("dir"));
+        // File live_marked None renders as "-", healthy dir as "yes".
+        assert!(out.contains("yes"));
+        assert!(out.contains('-'));
     }
 
     #[test]
