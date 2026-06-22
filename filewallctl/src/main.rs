@@ -27,6 +27,20 @@ const DEFAULT_RULES: &str = "/var/lib/filewall/rules.toml";
 const DEFAULT_PIDFILE: &str = "/run/filewall/filewalld.pid";
 const DEFAULT_CONTROL_SOCKET: &str = "/run/filewall/control.sock";
 
+#[derive(serde::Serialize)]
+struct StatusReport {
+    running: bool,
+    pid: Option<i32>,
+    state: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct Ack {
+    ok: bool,
+    pid: Option<i32>,
+    detail: String,
+}
+
 fn parse_pidfile(s: &str) -> Option<i32> {
     s.trim().parse::<i32>().ok()
 }
@@ -40,43 +54,73 @@ fn remove_at(rules: &mut Rules, index: usize) -> Option<filewall_rules::LearnedR
     }
 }
 
-fn cmd_list(path: &Path) -> ExitCode {
+fn cmd_list(path: &Path, format: Format) -> ExitCode {
     let rules = Rules::load(path);
-    if rules.rules.is_empty() {
-        println!("No learned rules ({})", path.display());
-        return ExitCode::SUCCESS;
+    match format {
+        Format::Table => {
+            if rules.rules.is_empty() {
+                println!("No learned rules ({})", path.display());
+                return ExitCode::SUCCESS;
+            }
+            println!("Learned rules ({}):", path.display());
+            for (i, r) in rules.rules.iter().enumerate() {
+                let cwd = r.cwd.as_deref().unwrap_or("-");
+                println!(
+                    "  [{i}] {:?} exe={} object={} kind={:?} cwd={} created_unix={}",
+                    r.action,
+                    r.exe,
+                    r.object.display(),
+                    r.object_kind,
+                    cwd,
+                    r.created_unix
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        _ => match render::emit(&rules.rules, format) {
+            Ok(s) => {
+                println!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("filewallctl: render failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
-    println!("Learned rules ({}):", path.display());
-    for (i, r) in rules.rules.iter().enumerate() {
-        let cwd = r.cwd.as_deref().unwrap_or("-");
-        println!(
-            "  [{i}] {:?} exe={} object={} kind={:?} cwd={} created_unix={}",
-            r.action,
-            r.exe,
-            r.object.display(),
-            r.object_kind,
-            cwd,
-            r.created_unix
-        );
-    }
-    ExitCode::SUCCESS
 }
 
-fn cmd_remove(index: usize, rules_path: &Path, pidfile: &Path) -> ExitCode {
+fn cmd_remove(index: usize, rules_path: &Path, pidfile: &Path, format: Format) -> ExitCode {
     let mut rules = Rules::load(rules_path);
     match remove_at(&mut rules, index) {
         Some(removed) => {
             if let Err(e) = rules.save_atomic(rules_path) {
-                eprintln!("filewallctl: could not write {}: {e}", rules_path.display());
+                let ack = Ack {
+                    ok: false,
+                    pid: None,
+                    detail: format!("could not write {}: {e}", rules_path.display()),
+                };
+                match format {
+                    Format::Table => eprintln!("filewallctl: {}", ack.detail),
+                    _ => print_ack(&ack, format),
+                }
                 return ExitCode::FAILURE;
             }
-            println!("Removed [{index}] {} -> {}", removed.exe, removed.object.display());
             // Best-effort: tell the daemon to reload.
-            let _ = send_sighup(pidfile);
+            let pid = send_sighup(pidfile).ok();
+            let detail = format!("removed [{index}] {} -> {}", removed.exe, removed.object.display());
+            match format {
+                Format::Table => println!("Removed [{index}] {} -> {}", removed.exe, removed.object.display()),
+                _ => print_ack(&Ack { ok: true, pid, detail }, format),
+            }
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("filewallctl: no rule at index {index}");
+            let ack = Ack { ok: false, pid: None, detail: format!("no rule at index {index}") };
+            match format {
+                Format::Table => eprintln!("filewallctl: {}", ack.detail),
+                _ => print_ack(&ack, format),
+            }
             ExitCode::FAILURE
         }
     }
@@ -91,16 +135,31 @@ fn send_sighup(pidfile: &Path) -> Result<i32, String> {
     Ok(pid)
 }
 
-fn cmd_reload(pidfile: &Path) -> ExitCode {
+fn cmd_reload(pidfile: &Path, format: Format) -> ExitCode {
     match send_sighup(pidfile) {
         Ok(pid) => {
-            println!("Sent SIGHUP to filewalld (pid {pid})");
+            let ack = Ack { ok: true, pid: Some(pid), detail: "sent SIGHUP".into() };
+            match format {
+                Format::Table => println!("Sent SIGHUP to filewalld (pid {pid})"),
+                _ => print_ack(&ack, format),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("filewallctl: reload failed: {e}");
+            match format {
+                Format::Table => eprintln!("filewallctl: reload failed: {e}"),
+                _ => print_ack(&Ack { ok: false, pid: None, detail: format!("reload failed: {e}") }, format),
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Render an Ack to stdout in json/yaml (table callers print their own line).
+fn print_ack(ack: &Ack, format: Format) {
+    match render::emit(ack, format) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("filewallctl: render failed: {e}"),
     }
 }
 
@@ -126,35 +185,48 @@ fn classify_liveness(probe: Result<(), Errno>) -> Liveness {
     }
 }
 
-fn cmd_status(pidfile: &Path) -> ExitCode {
+fn cmd_status(pidfile: &Path, format: Format) -> ExitCode {
+    let report = status_report(pidfile);
+    let code = if report.running { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    match format {
+        Format::Table => {
+            match report.state {
+                "running" => println!("filewalld: running (pid {})", report.pid.unwrap_or(0)),
+                "stale" => println!("filewalld: not running (stale pid {})", report.pid.unwrap_or(0)),
+                "no-pidfile" => println!("filewalld: not running (no pidfile)"),
+                "bad-pidfile" => println!("filewalld: unknown (bad pidfile)"),
+                other => println!("filewalld: {other} (pid {})", report.pid.unwrap_or(0)),
+            }
+            code
+        }
+        _ => match render::emit(&report, format) {
+            Ok(s) => {
+                println!("{s}");
+                code
+            }
+            Err(e) => {
+                eprintln!("filewallctl: render failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+/// Classify the daemon's status from its pidfile into a serializable report.
+fn status_report(pidfile: &Path) -> StatusReport {
     let text = match std::fs::read_to_string(pidfile) {
         Ok(t) => t,
-        Err(_) => {
-            println!("filewalld: not running (no pidfile)");
-            return ExitCode::FAILURE;
-        }
+        Err(_) => return StatusReport { running: false, pid: None, state: "no-pidfile" },
     };
     let pid = match parse_pidfile(&text) {
         Some(p) => p,
-        None => {
-            println!("filewalld: unknown (bad pidfile)");
-            return ExitCode::FAILURE;
-        }
+        None => return StatusReport { running: false, pid: None, state: "bad-pidfile" },
     };
     // Signal 0 probes liveness without delivering a signal.
     match classify_liveness(kill(Pid::from_raw(pid), None)) {
-        Liveness::Running => {
-            println!("filewalld: running (pid {pid})");
-            ExitCode::SUCCESS
-        }
-        Liveness::Stale => {
-            println!("filewalld: not running (stale pid {pid})");
-            ExitCode::FAILURE
-        }
-        Liveness::Unknown(e) => {
-            println!("filewalld: unknown (pid {pid}: {e})");
-            ExitCode::FAILURE
-        }
+        Liveness::Running => StatusReport { running: true, pid: Some(pid), state: "running" },
+        Liveness::Stale => StatusReport { running: false, pid: Some(pid), state: "stale" },
+        Liveness::Unknown(_) => StatusReport { running: false, pid: Some(pid), state: "unknown" },
     }
 }
 
@@ -280,7 +352,7 @@ fn main() -> ExitCode {
                 .get(1)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_RULES));
-            cmd_list(&path)
+            cmd_list(&path, format)
         }
         Some("remove") => {
             let Some(index) = args.get(1).and_then(|s| s.parse::<usize>().ok()) else {
@@ -291,21 +363,21 @@ fn main() -> ExitCode {
                 .get(2)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_RULES));
-            cmd_remove(index, &rules_path, Path::new(DEFAULT_PIDFILE))
+            cmd_remove(index, &rules_path, Path::new(DEFAULT_PIDFILE), format)
         }
         Some("reload") => {
             let pidfile = args
                 .get(1)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_PIDFILE));
-            cmd_reload(&pidfile)
+            cmd_reload(&pidfile, format)
         }
         Some("status") => {
             let pidfile = args
                 .get(1)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_PIDFILE));
-            cmd_status(&pidfile)
+            cmd_status(&pidfile, format)
         }
         _ => usage(),
     }
@@ -368,6 +440,23 @@ mod tests {
             classify_liveness(Err(Errno::EINVAL)),
             Liveness::Unknown(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn status_report_serializes() {
+        let r = super::StatusReport { running: true, pid: Some(42), state: "running" };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"pid\":42"));
+        assert!(json.contains("\"state\":\"running\""));
+    }
+
+    #[test]
+    fn ack_report_serializes() {
+        let r = super::Ack { ok: true, pid: Some(7), detail: "reloaded".into() };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"ok\":true"));
+        assert!(json.contains("\"detail\":\"reloaded\""));
     }
 
     #[test]
