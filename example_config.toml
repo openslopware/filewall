@@ -31,6 +31,10 @@ prompt_timeout_seconds = 120
 # Unix socket the daemon binds and the filewall-ui helper connects to.
 socket_path = "/run/filewall/prompt.sock"
 
+# Control socket for `filewallctl` queries (e.g. `dump`). Separate from the
+# prompt socket so the fail-closed prompt path is never touched.
+control_socket_path = "/run/filewall/control.sock"
+
 # Where "Always allow/deny" decisions are persisted (learned rules). The daemon
 # reloads this on the same trigger as the config.
 rules_path = "/var/lib/filewall/rules.toml"

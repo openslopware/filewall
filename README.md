@@ -26,7 +26,7 @@ primitive that synchronously blocks a syscall pending a userspace decision.
 | `filewalld`      | root (`CAP_SYS_ADMIN`) | Marks watched paths (single files directly; directories via `FAN_EVENT_ON_CHILD`, so new files and atomically-renamed files are covered automatically and new subdirs are live-marked via inotify), evaluates accesses against the allowlist **and learned rules**, asks the UI on a miss, persists "Always" decisions, answers the kernel. |
 | `filewall-ui-iced` | user session | **Default UI.** Renders the scope-aware prompt natively (iced, software-rendered) — showing whether an "Always" rule will cover one file or a whole tree — and returns the decision. No external GUI dependency. |
 | `filewall-ui`    | user session | Alternative UI that renders the same prompt via the external **yad** dialog. Mutually exclusive with `filewall-ui-iced` (only one may hold the daemon's prompt socket). |
-| `filewallctl`    | user (root for live paths) | Lists/removes learned rules; reloads (`SIGHUP`) and reports daemon status. |
+| `filewallctl`    | user (root for live paths) | Lists/removes learned rules; dumps watched objects; reloads (`SIGHUP`) and reports daemon status. JSON/YAML/table output. |
 | `filewall-proto` | library | Shared length-prefixed-JSON IPC types. |
 | `filewall-rules` | library | Learned-rule schema, atomic `rules.toml` store, deny-wins matcher (shared by daemon + ctl). |
 
@@ -215,12 +215,39 @@ For a packaged install that runs both as managed services, see
 
 ```sh
 filewallctl list                 # show persisted "Always" decisions
+filewallctl dump                 # show what the daemon is currently protecting
 filewallctl remove <index>       # revoke one, then auto-reloads the daemon
 filewallctl reload               # SIGHUP the daemon to re-read config + rules
 filewallctl status               # is filewalld running?
 ```
 
 The daemon also re-reads its config and `rules.toml` on `SIGHUP`.
+
+### Output formats
+
+Every `filewallctl` command accepts a global `--json`, `--yaml`, or `--table`
+flag (anywhere on the command line). `--table` is the default — including when
+output is piped, so a script must pass `--json`/`--yaml` explicitly.
+
+```sh
+filewallctl dump --json | jq '.objects[] | select(.fanotify == false)'
+```
+
+### `filewallctl dump`
+
+Live-queries the running daemon over its control socket
+(`control_socket_path`, default `/run/filewall/control.sock`) for every object
+it is currently protecting — including subdirectories discovered at runtime.
+Columns:
+
+| Column      | Meaning                                                                 |
+|-------------|------------------------------------------------------------------------|
+| `PATH`      | The marked file or directory.                                          |
+| `KIND`      | `file` (single inode) or `dir` (`FAN_EVENT_ON_CHILD` mark).            |
+| `RECURSIVE` | Whether the covering watch recurses into new subdirectories.           |
+| `FANOTIFY`  | The security mark — `no` is a coverage gap (e.g. ENOSPC on the limit). |
+| `LIVE`      | inotify watch present so new subdirs are live-marked; `-` for files.   |
+| `WATCH`     | The covering config `[[watch]]` root.                                  |
 
 ## Deferred (post-MVP)
 

@@ -21,6 +21,7 @@ KEY="$WATCH/secret.key"
 CFG="/tmp/filewall-e2e.toml"
 RULES="/tmp/filewall-e2e-rules.toml"
 SOCK="/run/filewall/prompt.sock"
+CTRL="/run/filewall/control.sock"
 DLOG="/tmp/filewalld.e2e.log"
 ULOG="/tmp/filewall-ui.e2e.log"
 
@@ -42,6 +43,7 @@ cat > "$CFG" <<EOF
 default_action = "prompt"
 prompt_timeout_seconds = 30
 socket_path = "$SOCK"
+control_socket_path = "$CTRL"
 rules_path = "$RULES"
 
 [[watch]]
@@ -72,6 +74,19 @@ if ! grep -q "entering event loop" "$DLOG"; then
   echo "!! daemon did not become ready; log:"; cat "$DLOG"; exit 1
 fi
 echo "daemon ready."
+
+echo
+echo "=== CASE 0: dump watched objects (control socket, no prompt) ==="
+echo "       ./target/release/filewallctl dump --json $CTRL"
+if ./target/release/filewallctl dump --json "$CTRL" | tee /tmp/filewall-e2e-dump.json | head -20; then
+  if grep -q "\"path\".*$WATCH" /tmp/filewall-e2e-dump.json; then
+    echo "RESULT: dump lists the watched path ✓"
+  else
+    echo "RESULT: dump did NOT list $WATCH ✗"
+  fi
+else
+  echo "RESULT: dump query FAILED ✗"
+fi
 
 echo
 echo "=== CASE 1: ALLOWED binary (head) — expect NO prompt, success ==="
