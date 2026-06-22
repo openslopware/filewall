@@ -6,7 +6,7 @@
 # For a reproducible/chroot build, switch to a VCS (-git) or tarball source.
 
 pkgname=filewall
-pkgver=0.4.0
+pkgver=0.4.1
 pkgrel=1
 pkgdesc="Synchronous, object-centric prompting for sensitive file access (fanotify)"
 arch=('x86_64')
