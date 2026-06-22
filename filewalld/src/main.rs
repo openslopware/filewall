@@ -12,9 +12,10 @@ mod watcher;
 
 use config::Config;
 use fanotify::Fanotify;
-use filewall_proto::{Decision, PromptRequest};
+use filewall_proto::{Decision, ObjKind, PromptRequest};
 use filewall_rules::{RuleAction, Rules};
 use log::{debug, info, warn};
+use markset::{MarkEntry, MarkSet};
 use policy::{combine, Outcome, Policy, WatchPolicy};
 use server::{is_disconnect, UiLink, UiServer};
 use std::os::fd::AsRawFd;
@@ -116,7 +117,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("listening on {}", cfg.socket_path.display());
 
     // Mark every watched root (files directly; directories via ON_CHILD).
-    let marked = mark_all(&fan, &policy);
+    let mut marks = MarkSet::new();
+    let marked = mark_all(&fan, &policy, &mut marks);
     info!("marked {marked} inode(s); entering event loop (UI connects on demand)");
 
     // Live-mark new subdirectories as they appear under directory watches.
@@ -129,7 +131,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop(
         &fan, &mut policy, &mut rules, &rules_path, &config_path, &server, &mut ui,
-        &mut treewatch, own_pid, ui_timeout_ms,
+        &mut treewatch, own_pid, ui_timeout_ms, &mut marks,
     )
 }
 
@@ -170,19 +172,32 @@ fn scan_watch(watch: &WatchPolicy) -> WatchScan {
 /// covered without a per-file mark). Idempotent (FAN_MARK_ADD on an already-marked
 /// inode is a no-op). Logs a per-watch summary, and warns loudly when a watch
 /// resolves to nothing markable so a misconfigured guard is never silent.
-fn mark_all(fan: &Fanotify, policy: &Policy) -> usize {
+fn mark_all(fan: &Fanotify, policy: &Policy, marks: &mut MarkSet) -> usize {
+    marks.clear();
     let mut marked = 0usize;
     for watch in policy.watches() {
         let root = watch.root();
+        let watch_root = root.to_path_buf();
+        let recursive = watch.recursive();
         match scan_watch(watch) {
             // Single-file watch: mark just that inode.
-            WatchScan::File(p) => match fan.mark_file(&p) {
-                Ok(()) => {
-                    info!("watch {}: marked 1 file", root.display());
-                    marked += 1;
-                }
-                Err(e) => warn!("could not mark {}: {e}", p.display()),
-            },
+            WatchScan::File(p) => {
+                let ok = match fan.mark_file(&p) {
+                    Ok(()) => {
+                        info!("watch {}: marked 1 file", root.display());
+                        marked += 1;
+                        true
+                    }
+                    Err(e) => {
+                        warn!("could not mark {}: {e}", p.display());
+                        false
+                    }
+                };
+                marks.record(
+                    &p,
+                    MarkEntry { kind: ObjKind::File, recursive, watch_root: watch_root.clone(), ok },
+                );
+            }
             // Directory watch: mark each directory with FAN_EVENT_ON_CHILD so its
             // immediate children are covered without a per-file mark.
             WatchScan::Dir(dirs) => {
@@ -192,10 +207,20 @@ fn mark_all(fan: &Fanotify, policy: &Policy) -> usize {
                 }
                 let mut n = 0usize;
                 for dir in &dirs {
-                    match fan.mark_dir(dir) {
-                        Ok(()) => n += 1,
-                        Err(e) => warn!("could not mark {}: {e}", dir.display()),
-                    }
+                    let ok = match fan.mark_dir(dir) {
+                        Ok(()) => {
+                            n += 1;
+                            true
+                        }
+                        Err(e) => {
+                            warn!("could not mark {}: {e}", dir.display());
+                            false
+                        }
+                    };
+                    marks.record(
+                        dir,
+                        MarkEntry { kind: ObjKind::Dir, recursive, watch_root: watch_root.clone(), ok },
+                    );
                 }
                 info!("watch {}: marked {n} dir(s) (children covered)", root.display());
                 marked += n;
@@ -224,6 +249,7 @@ fn event_loop(
     treewatch: &mut treewatch::TreeWatch,
     own_pid: u32,
     ui_timeout_ms: u32,
+    marks: &mut MarkSet,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // Poll the fanotify fd and the treewatch inotify fd together. A bounded
@@ -250,7 +276,7 @@ fn event_loop(
             // Drain new-subdirectory marks first, so files in a just-appeared subdir
             // are likelier covered before we process the fanotify backlog.
             if fds[1].revents & libc::POLLIN != 0 {
-                treewatch.on_ready(fan, policy);
+                treewatch.on_ready(fan, policy, marks);
             }
             if fds[0].revents & libc::POLLIN != 0 {
                 fan.read_ready()?
@@ -266,7 +292,7 @@ fn event_loop(
                     Ok(new_policy) => {
                         *policy = new_policy;
                         *rules = Rules::load(rules_path);
-                        let n = mark_all(fan, policy);
+                        let n = mark_all(fan, policy, marks);
                         // Rebuild the inotify watch set to match the re-marked dirs.
                         *treewatch = treewatch::TreeWatch::build(policy);
                         info!(

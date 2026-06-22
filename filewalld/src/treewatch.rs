@@ -11,8 +11,10 @@
 //! the fanotify fd (see `main.rs`) and calls [`TreeWatch::on_ready`] when it signals.
 
 use crate::fanotify::Fanotify;
+use crate::markset::{MarkEntry, MarkSet};
 use crate::policy::Policy;
 use crate::{scan_watch, walk_dirs, WatchScan};
+use filewall_proto::ObjKind;
 use log::{info, warn};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
 use std::collections::HashMap;
@@ -87,9 +89,15 @@ impl TreeWatch {
             .unwrap_or(-1)
     }
 
+    /// Whether `dir` currently has an inotify watch (its new subdirs get
+    /// live-marked). Used to report a directory's `live_marked` status in a dump.
+    pub fn is_watching(&self, dir: &Path) -> bool {
+        self.wd_map.values().any(|p| p == dir)
+    }
+
     /// Drain ready inotify events and live-mark any new subdirectories. Call only when
     /// `poll` reported `POLLIN` on [`raw_fd`](Self::raw_fd).
-    pub fn on_ready(&mut self, fan: &Fanotify, policy: &Policy) {
+    pub fn on_ready(&mut self, fan: &Fanotify, policy: &Policy, marks: &mut MarkSet) {
         let events = match self.inotify.as_ref() {
             Some(i) => match i.read_events() {
                 Ok(evs) => evs,
@@ -127,10 +135,25 @@ impl TreeWatch {
             // A moved-in directory may already contain a populated subtree, so mark +
             // watch the new dir and every non-excluded descendant dir, not just the top.
             for dir in dirs_to_mark(&new_dir, |p| watch.is_excluded(p)) {
-                match fan.mark_dir(&dir) {
-                    Ok(()) => info!("treewatch: marked new dir {} (children covered)", dir.display()),
-                    Err(e) => warn!("treewatch: could not mark {}: {e}", dir.display()),
-                }
+                let ok = match fan.mark_dir(&dir) {
+                    Ok(()) => {
+                        info!("treewatch: marked new dir {} (children covered)", dir.display());
+                        true
+                    }
+                    Err(e) => {
+                        warn!("treewatch: could not mark {}: {e}", dir.display());
+                        false
+                    }
+                };
+                marks.record(
+                    &dir,
+                    MarkEntry {
+                        kind: ObjKind::Dir,
+                        recursive: watch.recursive(),
+                        watch_root: watch.root().to_path_buf(),
+                        ok,
+                    },
+                );
                 self.add(&dir);
             }
         }
@@ -171,6 +194,16 @@ fn dirs_to_mark(new_dir: &Path, is_excluded: impl Fn(&Path) -> bool) -> Vec<Path
 mod tests {
     use super::dirs_to_mark;
     use std::path::PathBuf;
+
+    #[test]
+    fn is_watching_false_for_unknown_and_when_inert() {
+        // An inert TreeWatch (inotify unavailable) watches nothing.
+        let tw = super::TreeWatch {
+            inotify: None,
+            wd_map: std::collections::HashMap::new(),
+        };
+        assert!(!tw.is_watching(std::path::Path::new("/anything")));
+    }
 
     fn tmp_tree(tag: &str) -> PathBuf {
         let ts = std::time::SystemTime::now()
