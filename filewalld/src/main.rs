@@ -154,6 +154,10 @@ fn scan_watch(watch: &WatchPolicy) -> WatchScan {
     let root = watch.root();
     match std::fs::symlink_metadata(root) {
         Ok(m) if m.is_file() => WatchScan::File(root.to_path_buf()),
+        // A non-recursive watch (scoped by shallow `patterns`) marks only the root
+        // directory: its `ON_CHILD` mark covers the matching immediate children, and
+        // we deliberately do not descend — that is what keeps it to a single mark.
+        Ok(m) if m.is_dir() && !watch.recursive() => WatchScan::Dir(vec![root.to_path_buf()]),
         Ok(m) if m.is_dir() => WatchScan::Dir(walk_dirs(root, |p| watch.is_excluded(p))),
         _ => WatchScan::Unresolved,
     }
@@ -292,6 +296,14 @@ fn event_loop(
                 if w.is_excluded(&path) {
                     let _ = fan.respond(ev, true);
                     debug!("ALLOW (excluded) pid {} -> {}", ev.pid, path.display());
+                    continue;
+                }
+                // Pattern scoping: a directory's ON_CHILD mark fires for *every* child,
+                // so a child matching none of the watch's `patterns` is out of scope —
+                // allow + skip it (the mirror of `exclude`). Empty patterns = whole tree.
+                if !w.is_included(&path) {
+                    let _ = fan.respond(ev, true);
+                    debug!("ALLOW (no pattern match) pid {} -> {}", ev.pid, path.display());
                     continue;
                 }
             }
@@ -455,7 +467,12 @@ mod tests {
     }
 
     fn watch_for(root: &Path, exclude: &[String]) -> WatchPolicy {
-        WatchPolicy::new(root, &[], Action::Prompt, ObjectKind::File, false, exclude).unwrap()
+        WatchPolicy::new(root, &[], Action::Prompt, ObjectKind::File, false, exclude, &[]).unwrap()
+    }
+
+    fn watch_with_patterns(root: &Path, patterns: &[&str]) -> WatchPolicy {
+        let pats: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+        WatchPolicy::new(root, &[], Action::Prompt, ObjectKind::File, false, &[], &pats).unwrap()
     }
 
     #[test]
@@ -505,6 +522,31 @@ mod tests {
             scan_watch(&watch_for(&empty, &[])),
             WatchScan::Dir(ref d) if d == &vec![empty.clone()]
         ));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_watch_shallow_patterns_marks_only_root_deep_walks() {
+        let base = unique_tmp("scan-patterns");
+        std::fs::create_dir_all(base.join("sub/deep")).unwrap();
+        std::fs::write(base.join(".zsh_history"), b"x").unwrap();
+
+        // Shallow patterns -> non-recursive -> Dir([root]) only, no descent.
+        match scan_watch(&watch_with_patterns(&base, &["*_history"])) {
+            WatchScan::Dir(dirs) => assert_eq!(dirs, vec![base.clone()]),
+            other => panic!("expected Dir([root]), got {other:?}"),
+        }
+
+        // A deep pattern -> recursive -> the full subtree is walked and marked.
+        match scan_watch(&watch_with_patterns(&base, &["**/*_history"])) {
+            WatchScan::Dir(dirs) => {
+                assert!(dirs.contains(&base));
+                assert!(dirs.contains(&base.join("sub")));
+                assert!(dirs.contains(&base.join("sub/deep")));
+            }
+            other => panic!("expected recursive Dir, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

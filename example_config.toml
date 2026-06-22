@@ -59,6 +59,26 @@ rules_path = "/var/lib/filewall/rules.toml"
 #                   filters these out itself). Use it to silence known-noisy files.
 #                 Same glob rules as `allow`.
 #
+#   patterns      Globs selecting WHICH children are in scope for prompting,
+#                 matched RELATIVE to `path` (so `*_history` means "a file directly
+#                 in this dir"). Empty (default) = the whole tree is in scope, the
+#                 classic directory watch. When set, a child matching none of these
+#                 is auto-allowed at access time. Use it to guard just a class of
+#                 files (e.g. shell history) in an otherwise-uninteresting directory
+#                 without listing each one or marking everything inside.
+#                 Glob rules match `allow`/`exclude` (`*` does NOT cross `/`, `**` does).
+#                 RECURSION IS DERIVED FROM THE PATTERN, not a flag:
+#                   - a SHALLOW pattern (`*_history`, no `/` or `**`) matches only
+#                     immediate children, so filewalld marks JUST this one directory —
+#                     one fanotify mark, cheap, and robust to atomic temp+rename.
+#                   - a DEEP pattern (contains `**` or `/`, e.g. `**/*_history`)
+#                     matches at any depth, which forces marking the ENTIRE subtree
+#                     (one mark + one inotify watch per sub-directory, like a normal
+#                     tree watch). filewalld logs a warning at load for each deep
+#                     pattern: a careless `**` can exhaust fs.fanotify.max_user_marks /
+#                     fs.inotify.max_user_watches and leave OTHER watches unmarked.
+#                 `exclude` still prunes noisy subtrees out of a deep walk.
+#
 #   learn_object  What an "Always" decision records: "file" (this exact path,
 #                 default) or "tree" (the whole watch root). Use "tree" for
 #                 sprawling app-config dirs where per-file rules are unmanageable.
@@ -127,3 +147,31 @@ allow = ["/usr/bin/gpg", "/usr/bin/gpg-agent"]
 exclude = ["**/*.lock", "**/random_seed"]
 learn_object = "tree"
 learn_match = ["exe"]
+
+
+# Approach 6 — Guard a CLASS of files in a busy dir with `patterns` (shallow).
+# Shell-history files live directly in $HOME alongside thousands of unrelated
+# files. Listing each one is tedious and fragile (zsh/bash rewrite history via
+# atomic temp+rename, which orphans a single-file mark). Instead, mark just $HOME
+# and prompt only for the history-shaped files; everything else is auto-allowed.
+# All patterns here are shallow (no `**` or `/`), so this costs ONE fanotify mark.
+[[watch]]
+path = "~"
+allow = []
+patterns = [".zsh_history", ".bash_history", ".python_history", "*_history"]
+learn_object = "file"
+learn_match = ["exe"]
+
+
+# Approach 7 — Same idea but RECURSIVE (deep pattern).
+# Catch history files nested anywhere under ~/.config too. The `**/` makes this a
+# full-subtree watch (one mark + inotify watch per sub-directory): filewalld logs a
+# warning at load, and you should `exclude` the noisy trees to stay within the
+# kernel's mark/watch limits.
+# [[watch]]
+# path = "~/.config"
+# allow = []
+# patterns = ["**/*_history"]
+# exclude = ["**/Cache", "**/Cache_Data", "**/GPUCache"]
+# learn_object = "file"
+# learn_match = ["exe"]

@@ -11,8 +11,9 @@
 //! exclude = ["**/Cache", "**/Cache_Data"]  # subtrees to leave unmarked
 //! ```
 
-use crate::policy::{Action, Policy, WatchPolicy};
+use crate::policy::{pattern_is_deep, Action, Policy, WatchPolicy};
 use filewall_rules::ObjectKind;
+use log::warn;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -48,6 +49,14 @@ pub struct WatchConfig {
     /// Subset of ["exe","cwd"]; "cwd" opts the watch into cwd-pinned rules.
     #[serde(default)]
     pub learn_match: Vec<String>,
+    /// Filename/path globs (matched *relative to* `path`) selecting which children
+    /// are in scope for prompting. Empty = the whole tree (classic dir watch). A
+    /// shallow pattern like `*_history` matches files directly in the dir and marks
+    /// only that one directory; a deep pattern (`**/...` or one containing `/`) matches
+    /// at any depth and forces marking the whole subtree — which may exhaust
+    /// `fs.fanotify.max_user_marks` / `fs.inotify.max_user_watches` (warned at load).
+    #[serde(default)]
+    pub patterns: Vec<String>,
 }
 
 fn default_action() -> Action {
@@ -94,6 +103,16 @@ impl Config {
         for w in &self.watch {
             let root = canonicalize_root(expand_home(&w.path));
             let learn_cwd = w.learn_match.iter().any(|m| m == "cwd");
+            // A deep pattern forces marking the whole subtree; warn loudly so an
+            // accidental `**` that could exhaust the kernel's mark/watch limits (and
+            // thereby leave *other* watches unmarked) is never silent.
+            for pat in w.patterns.iter().filter(|p| pattern_is_deep(p)) {
+                warn!(
+                    "watch {}: recursive pattern '{}' marks the entire subtree; \
+                     this may exhaust fs.fanotify.max_user_marks / fs.inotify.max_user_watches",
+                    w.path, pat
+                );
+            }
             let wp = WatchPolicy::new(
                 root,
                 &w.allow,
@@ -101,6 +120,7 @@ impl Config {
                 w.learn_object,
                 learn_cwd,
                 &w.exclude,
+                &w.patterns,
             )
             .map_err(|e| ConfigError::Glob(w.path.clone(), e))?;
             watches.push(wp);
@@ -284,6 +304,51 @@ mod tests {
             [[watch]]
             path = "/x"
             exclude = ["[invalid"]
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(bad.build_policy(), Err(ConfigError::Glob(_, _))));
+    }
+
+    #[test]
+    fn patterns_default_parse_and_build() {
+        let cfg = Config::from_str(
+            r#"
+            [[watch]]
+            path = "/home/u"
+            [[watch]]
+            path = "/home/u2"
+            patterns = ["*_history", "**/*_history"]
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.watch[0].patterns.is_empty());
+        assert_eq!(cfg.watch[1].patterns, vec!["*_history", "**/*_history"]);
+        // Patterns are wired into the policy and compiled.
+        let policy = cfg.build_policy().unwrap();
+        let w = &policy.watches()[1];
+        assert!(w.recursive()); // a deep pattern forces recursion
+        assert!(w.is_included(Path::new("/home/u2/.zsh_history")));
+        assert!(w.is_included(Path::new("/home/u2/sub/foo_history")));
+        assert!(!w.is_included(Path::new("/home/u2/sub/notes.txt")));
+        // Shallow-only watch is non-recursive.
+        let shallow = Config::from_str(
+            r#"
+            [[watch]]
+            path = "/home/u"
+            patterns = ["*_history"]
+            "#,
+        )
+        .unwrap()
+        .build_policy()
+        .unwrap();
+        assert!(!shallow.watches()[0].recursive());
+        // An invalid pattern glob is surfaced as a build error.
+        let bad = Config::from_str(
+            r#"
+            [[watch]]
+            path = "/x"
+            patterns = ["[invalid"]
             "#,
         )
         .unwrap();

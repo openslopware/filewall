@@ -158,11 +158,38 @@ rules_path  = "/var/lib/filewall/rules.toml"   # where "Always" decisions persis
 path = "/home/you/.ssh"            # ~ expands to the daemon's $HOME; symlinked roots are canonicalized
 allow = ["/usr/bin/ssh", "/usr/bin/ssh-*", "/usr/bin/git"]
 exclude = ["**/Cache"]             # prune noisy subtrees; file globs auto-allow at access time
+patterns = []                      # empty = guard the whole tree; see below to scope by filename
 learn_object = "file"              # "file" | "tree" — scope of an "Always" rule
 learn_match  = ["exe"]             # add "cwd" to pin the working directory too
 ```
 
 Glob semantics: `*` does not cross `/`; `**` does.
+
+**Scoping a watch to a class of files (`patterns`).** To guard, say, only the
+shell-history files in an otherwise-uninteresting directory without listing each
+one, set `patterns` (globs matched *relative to* `path`). Empty (the default)
+guards the whole tree. The pattern's shape decides how much gets marked:
+
+```toml
+[[watch]]
+path = "/home/you"                 # $HOME holds thousands of unrelated files
+allow = []
+patterns = [".zsh_history", ".bash_history", "*_history"]   # shallow → ONE mark on ~
+learn_object = "file"
+```
+
+- A **shallow** pattern (`*_history`, no `/` or `**`) matches only files *directly*
+  in the dir, so filewalld marks **just that one directory** — one fanotify mark,
+  and robust to the atomic temp+rename that zsh/bash use to rewrite history (a
+  single-file mark would be orphaned by the rename; the directory mark is not).
+- A **deep** pattern (`**/*_history`, or anything containing `/`) matches at any
+  depth and therefore marks the **entire subtree** (one mark + one inotify watch per
+  sub-directory). filewalld logs a warning at load for each deep pattern — a careless
+  `**` can exhaust `fs.fanotify.max_user_marks` / `fs.inotify.max_user_watches` and
+  leave *other* watches unmarked. `exclude` still prunes noisy subtrees from the walk.
+
+Children matching none of the `patterns` are auto-allowed at access time (the
+mirror of `exclude`).
 
 > **`~` resolves to the *daemon's* home.** As a system service `filewalld` runs as
 > **root**, so `~` expands to `/root`, not your login home. To guard a user's files

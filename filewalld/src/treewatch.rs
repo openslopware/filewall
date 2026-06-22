@@ -59,6 +59,12 @@ impl TreeWatch {
             wd_map: HashMap::new(),
         };
         for watch in policy.watches() {
+            // A non-recursive watch (scoped by shallow `patterns`) marks only its root
+            // and must never live-mark new subdirs — that would silently make it
+            // recursive. Skip it so its subtree stays unwatched by design.
+            if !watch.recursive() {
+                continue;
+            }
             if let WatchScan::Dir(dirs) = scan_watch(watch) {
                 for dir in &dirs {
                     tw.add(dir);
