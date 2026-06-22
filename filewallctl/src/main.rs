@@ -7,6 +7,7 @@
 //!   status [pidfile]         Report whether the daemon is running.
 
 mod format;
+mod render;
 
 use filewall_rules::Rules;
 use nix::errno::Errno;
