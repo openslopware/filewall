@@ -25,6 +25,8 @@ pub struct Config {
     pub prompt_timeout_seconds: u64,
     #[serde(default = "default_socket")]
     pub socket_path: PathBuf,
+    #[serde(default = "default_control_socket")]
+    pub control_socket_path: PathBuf,
     #[serde(default = "default_rules_path")]
     pub rules_path: PathBuf,
     #[serde(default)]
@@ -67,6 +69,9 @@ fn default_timeout() -> u64 {
 }
 fn default_socket() -> PathBuf {
     PathBuf::from("/run/filewall/prompt.sock")
+}
+fn default_control_socket() -> PathBuf {
+    PathBuf::from("/run/filewall/control.sock")
 }
 fn default_learn_object() -> ObjectKind {
     ObjectKind::File
@@ -179,6 +184,21 @@ mod tests {
         assert_eq!(cfg.prompt_timeout_seconds, 15);
         assert_eq!(cfg.watch.len(), 1);
         assert_eq!(cfg.watch[0].path, "/home/user/.ssh");
+    }
+
+    #[test]
+    fn control_socket_path_defaults_when_absent() {
+        let cfg = Config::from_str("default_action = \"prompt\"\n").unwrap();
+        assert_eq!(
+            cfg.control_socket_path,
+            PathBuf::from("/run/filewall/control.sock")
+        );
+    }
+
+    #[test]
+    fn control_socket_path_is_read_when_present() {
+        let cfg = Config::from_str("control_socket_path = \"/tmp/ctl.sock\"\n").unwrap();
+        assert_eq!(cfg.control_socket_path, PathBuf::from("/tmp/ctl.sock"));
     }
 
     #[test]
