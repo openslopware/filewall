@@ -153,6 +153,7 @@ impl WatchPolicy {
     ) -> LearnedRule {
         let (object, object_kind) = self.always_target(path);
         LearnedRule {
+            id: 0, // unassigned; Rules::push stamps the real id at persist time
             created_unix: now_unix(),
             action,
             exe: exe.to_string(),

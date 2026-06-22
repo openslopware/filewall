@@ -27,6 +27,11 @@ pub enum ObjectKind {
 /// One persisted decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearnedRule {
+    /// Stable identifier, assigned at creation and never reused. `0` is the
+    /// "unassigned" sentinel: rules loaded from a pre-id `rules.toml` carry `0`
+    /// until [`Rules::backfill_ids`] stamps a real id (which start at `1`).
+    #[serde(default)]
+    pub id: u64,
     /// Creation time, seconds since the Unix epoch.
     pub created_unix: u64,
     pub action: RuleAction,
@@ -61,8 +66,17 @@ impl LearnedRule {
 }
 
 /// The full learned-rule set, mirrored to `rules.toml`.
+///
+/// `next_id` MUST stay the first field: the `toml` crate serializes fields in
+/// declaration order, and TOML forbids a bare key (`next_id = N`) after an
+/// array-of-tables (`[[rule]]`). Declaring it after `rules` would emit invalid
+/// TOML that fails to re-parse. The `save_load_preserves_ids_and_next_id` test
+/// guards this.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Rules {
+    /// Monotonic id allocator; only ever climbs, so ids are never reused.
+    #[serde(default)]
+    pub next_id: u64,
     #[serde(default, rename = "rule")]
     pub rules: Vec<LearnedRule>,
 }
@@ -76,8 +90,11 @@ impl Rules {
             Ok(t) => t,
             Err(_) => return Rules::default(),
         };
-        match toml::from_str(&text) {
-            Ok(rs) => rs,
+        match toml::from_str::<Rules>(&text) {
+            Ok(mut rs) => {
+                rs.backfill_ids();
+                rs
+            }
             Err(e) => {
                 eprintln!(
                     "[filewall] warning: ignoring corrupt rules file {}: {e}",
@@ -107,7 +124,31 @@ impl Rules {
         std::fs::rename(&tmp, path)
     }
 
-    pub fn push(&mut self, rule: LearnedRule) {
+    /// Allocate the next stable id, advancing the monotonic counter.
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id.max(1); // ids start at 1; 0 is the sentinel
+        self.next_id = id + 1;
+        id
+    }
+
+    /// Assign ids to any rule still carrying the `0` sentinel (e.g. loaded from
+    /// a pre-id `rules.toml`), in `Vec` order. Deterministic and idempotent: the
+    /// same file content yields the same ids in every process, so an unprivileged
+    /// reader and the daemon agree without coordination. `next_id` is advanced
+    /// past every id present.
+    pub fn backfill_ids(&mut self) {
+        let max_id = self.rules.iter().map(|r| r.id).max().unwrap_or(0);
+        self.next_id = self.next_id.max(max_id + 1);
+        for r in &mut self.rules {
+            if r.id == 0 {
+                r.id = self.next_id;
+                self.next_id += 1;
+            }
+        }
+    }
+
+    pub fn push(&mut self, mut rule: LearnedRule) {
+        rule.id = self.alloc_id();
         self.rules.push(rule);
     }
 
@@ -145,6 +186,7 @@ mod tests {
 
     fn tree_allow(exe: &str, root: &str) -> LearnedRule {
         LearnedRule {
+            id: 0,
             created_unix: 0,
             action: RuleAction::Allow,
             exe: exe.into(),
@@ -165,6 +207,7 @@ mod tests {
     #[test]
     fn file_rule_requires_exact_path() {
         let r = LearnedRule {
+            id: 0,
             created_unix: 0,
             action: RuleAction::Allow,
             exe: "/usr/bin/git".into(),
@@ -228,6 +271,70 @@ mod tests {
     fn load_missing_file_is_empty() {
         let rs = Rules::load(Path::new("/nonexistent/filewall/rules.toml"));
         assert!(rs.rules.is_empty());
+    }
+
+    #[test]
+    fn backfill_assigns_sequential_ids_in_order() {
+        let mut rs = Rules::default();
+        rs.rules.push(tree_allow("/usr/bin/a", "/x"));
+        rs.rules.push(tree_allow("/usr/bin/b", "/y"));
+        rs.backfill_ids();
+        assert_eq!(rs.rules[0].id, 1);
+        assert_eq!(rs.rules[1].id, 2);
+        assert_eq!(rs.next_id, 3);
+    }
+
+    #[test]
+    fn backfill_preserves_existing_ids_and_advances_next_id() {
+        let mut rs = Rules::default();
+        let mut r1 = tree_allow("/usr/bin/a", "/x");
+        r1.id = 5;
+        rs.rules.push(r1);
+        rs.rules.push(tree_allow("/usr/bin/b", "/y")); // id 0 -> backfilled
+        rs.backfill_ids();
+        assert_eq!(rs.rules[0].id, 5, "existing id preserved");
+        assert_eq!(rs.rules[1].id, 6, "new id is max+1");
+        assert_eq!(rs.next_id, 7);
+    }
+
+    #[test]
+    fn push_allocates_and_bumps_next_id() {
+        let mut rs = Rules::default();
+        rs.push(tree_allow("/usr/bin/a", "/x"));
+        rs.push(tree_allow("/usr/bin/b", "/y"));
+        assert_eq!(rs.rules[0].id, 1);
+        assert_eq!(rs.rules[1].id, 2);
+        assert_eq!(rs.next_id, 3);
+    }
+
+    #[test]
+    fn no_id_reuse_after_remove() {
+        let mut rs = Rules::default();
+        rs.push(tree_allow("/usr/bin/a", "/x")); // id 1
+        rs.push(tree_allow("/usr/bin/b", "/y")); // id 2
+        rs.rules.remove(1); // drop id 2
+        rs.push(tree_allow("/usr/bin/c", "/z")); // must NOT reuse 2
+        assert_eq!(rs.rules.last().unwrap().id, 3);
+    }
+
+    #[test]
+    fn save_load_preserves_ids_and_next_id() {
+        let mut rs = Rules::default();
+        rs.push(tree_allow("/usr/bin/git", "/home/u/.ssh")); // id 1, next_id 2
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "filewall-rules-ids-{}-{}-{}.toml",
+            std::process::id(),
+            ts.as_secs(),
+            ts.subsec_nanos()
+        ));
+        rs.save_atomic(&path).unwrap();
+        let back = Rules::load(&path);
+        assert_eq!(back.rules[0].id, 1);
+        assert_eq!(back.next_id, 2);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

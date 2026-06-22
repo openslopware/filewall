@@ -214,14 +214,24 @@ For a packaged install that runs both as managed services, see
 ## Managing learned rules
 
 ```sh
-filewallctl list                 # show persisted "Always" decisions
+filewallctl list                 # show persisted "Always" decisions (with stable IDs)
 filewallctl dump                 # show what the daemon is currently protecting
-filewallctl remove <index>       # revoke one, then auto-reloads the daemon
+filewallctl remove <id> [id...]  # revoke one or more by ID, then auto-reloads the daemon
 filewallctl reload               # SIGHUP the daemon to re-read config + rules
 filewallctl status               # is filewalld running?
 ```
 
-The daemon also re-reads its config and `rules.toml` on `SIGHUP`.
+Each rule carries a stable `ID` (shown by `list`) that never changes when other
+rules are removed, so `list` output is safe to drive automation. `remove` takes
+one or more of those IDs and applies them in a single pass; it exits non-zero if
+any given ID matched no rule. The daemon also re-reads its config and
+`rules.toml` on `SIGHUP`.
+
+```sh
+# revoke every rule for a given exe in one call
+filewallctl list --json | jq -r '.[] | select(.exe == "/usr/bin/node") | .id' \
+  | xargs -r filewallctl remove
+```
 
 ### Output formats
 

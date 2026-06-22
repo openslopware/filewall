@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //!   list   [rules_path]      Print learned rules.
-//!   remove <index> [path]    Remove a rule by index, then SIGHUP the daemon.
+//!   remove <id> [id...]      Remove rules by stable id, then SIGHUP the daemon.
 //!   reload [pidfile]         Send SIGHUP to the running daemon.
 //!   status [pidfile]         Report whether the daemon is running.
 
@@ -39,19 +39,36 @@ struct Ack {
     ok: bool,
     pid: Option<i32>,
     detail: String,
+    /// Stable ids actually removed (empty for non-remove acks).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<u64>,
+    /// Requested ids that matched no rule (empty when all matched).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing: Vec<u64>,
 }
 
 fn parse_pidfile(s: &str) -> Option<i32> {
     s.trim().parse::<i32>().ok()
 }
 
-/// Remove the rule at `index`, returning it, or `None` if out of range.
-fn remove_at(rules: &mut Rules, index: usize) -> Option<filewall_rules::LearnedRule> {
-    if index < rules.rules.len() {
-        Some(rules.rules.remove(index))
-    } else {
-        None
-    }
+/// Remove every rule whose stable id is in `ids`. Returns the removed rules (in
+/// their original file order) and any requested ids that matched no rule.
+fn remove_ids(rules: &mut Rules, ids: &[u64]) -> (Vec<filewall_rules::LearnedRule>, Vec<u64>) {
+    let mut removed = Vec::new();
+    rules.rules.retain(|r| {
+        if ids.contains(&r.id) {
+            removed.push(r.clone());
+            false
+        } else {
+            true
+        }
+    });
+    let missing: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|id| !removed.iter().any(|r| r.id == *id))
+        .collect();
+    (removed, missing)
 }
 
 fn cmd_list(path: &Path, format: Format) -> ExitCode {
@@ -78,39 +95,58 @@ fn cmd_list(path: &Path, format: Format) -> ExitCode {
     }
 }
 
-fn cmd_remove(index: usize, rules_path: &Path, pidfile: &Path, format: Format) -> ExitCode {
+fn cmd_remove(ids: &[u64], rules_path: &Path, pidfile: &Path, format: Format) -> ExitCode {
     let mut rules = Rules::load(rules_path);
-    match remove_at(&mut rules, index) {
-        Some(removed) => {
-            if let Err(e) = rules.save_atomic(rules_path) {
-                let ack = Ack {
-                    ok: false,
-                    pid: None,
-                    detail: format!("could not write {}: {e}", rules_path.display()),
-                };
-                match format {
-                    Format::Table => eprintln!("filewallctl: {}", ack.detail),
-                    _ => print_ack(&ack, format),
-                }
-                return ExitCode::FAILURE;
-            }
-            // Best-effort: tell the daemon to reload.
-            let pid = send_sighup(pidfile).ok();
-            let detail = format!("removed [{index}] {} -> {}", removed.exe, removed.object.display());
-            match format {
-                Format::Table => println!("Removed [{index}] {} -> {}", removed.exe, removed.object.display()),
-                _ => print_ack(&Ack { ok: true, pid, detail }, format),
-            }
-            ExitCode::SUCCESS
-        }
-        None => {
-            let ack = Ack { ok: false, pid: None, detail: format!("no rule at index {index}") };
+    let (removed, missing) = remove_ids(&mut rules, ids);
+
+    // Persist and signal the daemon only if something actually changed.
+    let mut pid = None;
+    if !removed.is_empty() {
+        if let Err(e) = rules.save_atomic(rules_path) {
+            let ack = Ack {
+                ok: false,
+                pid: None,
+                detail: format!("could not write {}: {e}", rules_path.display()),
+                removed: vec![],
+                missing: vec![],
+            };
             match format {
                 Format::Table => eprintln!("filewallctl: {}", ack.detail),
                 _ => print_ack(&ack, format),
             }
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+        // Best-effort: tell the daemon to reload.
+        pid = send_sighup(pidfile).ok();
+    }
+
+    let removed_ids: Vec<u64> = removed.iter().map(|r| r.id).collect();
+    let ok = missing.is_empty();
+    let detail = format!("removed {} rule(s), {} missing", removed.len(), missing.len());
+    match format {
+        Format::Table => {
+            for r in &removed {
+                println!("Removed [{}] {} -> {}", r.id, r.exe, r.object.display());
+            }
+            if !missing.is_empty() {
+                let list = missing
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!("filewallctl: no rule with id {list}");
+            }
+        }
+        _ => print_ack(
+            &Ack { ok, pid, detail, removed: removed_ids, missing: missing.clone() },
+            format,
+        ),
+    }
+    // Strict: any unmatched id is a failure, even though matched ids were removed.
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -126,7 +162,13 @@ fn send_sighup(pidfile: &Path) -> Result<i32, String> {
 fn cmd_reload(pidfile: &Path, format: Format) -> ExitCode {
     match send_sighup(pidfile) {
         Ok(pid) => {
-            let ack = Ack { ok: true, pid: Some(pid), detail: "sent SIGHUP".into() };
+            let ack = Ack {
+                ok: true,
+                pid: Some(pid),
+                detail: "sent SIGHUP".into(),
+                removed: vec![],
+                missing: vec![],
+            };
             match format {
                 Format::Table => println!("Sent SIGHUP to filewalld (pid {pid})"),
                 _ => print_ack(&ack, format),
@@ -134,9 +176,16 @@ fn cmd_reload(pidfile: &Path, format: Format) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
+            let ack = Ack {
+                ok: false,
+                pid: None,
+                detail: format!("reload failed: {e}"),
+                removed: vec![],
+                missing: vec![],
+            };
             match format {
                 Format::Table => eprintln!("filewallctl: reload failed: {e}"),
-                _ => print_ack(&Ack { ok: false, pid: None, detail: format!("reload failed: {e}") }, format),
+                _ => print_ack(&ack, format),
             }
             ExitCode::FAILURE
         }
@@ -256,10 +305,9 @@ fn dump_table(resp: &DumpResponse) -> String {
 fn list_table(rules: &[filewall_rules::LearnedRule], path: &Path) -> String {
     let rows: Vec<Vec<String>> = rules
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
+        .map(|r| {
             vec![
-                i.to_string(),
+                r.id.to_string(),
                 format!("{:?}", r.action).to_lowercase(),
                 r.exe.clone(),
                 r.object.display().to_string(),
@@ -270,7 +318,7 @@ fn list_table(rules: &[filewall_rules::LearnedRule], path: &Path) -> String {
         })
         .collect();
     let mut out = render::render_table(
-        &["IDX", "ACTION", "EXE", "OBJECT", "KIND", "CWD", "CREATED"],
+        &["ID", "ACTION", "EXE", "OBJECT", "KIND", "CWD", "CREATED"],
         &rows,
     );
     out.push_str(&format!("\n{} rule(s) ({})\n", rules.len(), path.display()));
@@ -342,7 +390,7 @@ fn usage() -> ExitCode {
          commands:\n  \
          list   [rules_path]      Print learned rules\n  \
          dump   [control_socket]  Print objects the daemon is protecting\n  \
-         remove <index> [path]    Remove a rule by index, then SIGHUP the daemon\n  \
+         remove <id> [id...]      Remove rules by stable id, then SIGHUP the daemon\n  \
          reload [pidfile]         Send SIGHUP to the running daemon\n  \
          status [pidfile]         Report whether the daemon is running"
     );
@@ -368,15 +416,20 @@ fn main() -> ExitCode {
             cmd_list(&path, format)
         }
         Some("remove") => {
-            let Some(index) = args.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("filewallctl: remove needs a numeric <index>");
-                return usage();
-            };
-            let rules_path = args
-                .get(2)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_RULES));
-            cmd_remove(index, &rules_path, Path::new(DEFAULT_PIDFILE), format)
+            let parsed: Result<Vec<u64>, _> =
+                args[1..].iter().map(|s| s.parse::<u64>()).collect();
+            match parsed {
+                Ok(ids) if !ids.is_empty() => cmd_remove(
+                    &ids,
+                    Path::new(DEFAULT_RULES),
+                    Path::new(DEFAULT_PIDFILE),
+                    format,
+                ),
+                _ => {
+                    eprintln!("filewallctl: remove needs one or more numeric <id>");
+                    usage()
+                }
+            }
         }
         Some("reload") => {
             let pidfile = args
@@ -398,13 +451,14 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_liveness, parse_pidfile, remove_at, Liveness};
+    use super::{classify_liveness, parse_pidfile, Liveness};
     use filewall_rules::{LearnedRule, ObjectKind, RuleAction, Rules};
     use nix::errno::Errno;
     use std::path::PathBuf;
 
     fn rule(exe: &str) -> LearnedRule {
         LearnedRule {
+            id: 0,
             created_unix: 0,
             action: RuleAction::Allow,
             exe: exe.into(),
@@ -421,12 +475,15 @@ mod tests {
     }
 
     #[test]
-    fn remove_at_removes_in_range() {
+    fn remove_ids_removes_matched_reports_missing() {
         let mut rs = Rules::default();
-        rs.push(rule("/usr/bin/a"));
-        rs.push(rule("/usr/bin/b"));
-        let removed = remove_at(&mut rs, 0).unwrap();
-        assert_eq!(removed.exe, "/usr/bin/a");
+        rs.push(rule("/usr/bin/a")); // id 1
+        rs.push(rule("/usr/bin/b")); // id 2
+        rs.push(rule("/usr/bin/c")); // id 3
+        let (removed, missing) = super::remove_ids(&mut rs, &[1, 3, 99]);
+        let removed_exes: Vec<&str> = removed.iter().map(|r| r.exe.as_str()).collect();
+        assert_eq!(removed_exes, vec!["/usr/bin/a", "/usr/bin/c"]);
+        assert_eq!(missing, vec![99]);
         assert_eq!(rs.rules.len(), 1);
         assert_eq!(rs.rules[0].exe, "/usr/bin/b");
     }
@@ -466,7 +523,13 @@ mod tests {
 
     #[test]
     fn ack_report_serializes() {
-        let r = super::Ack { ok: true, pid: Some(7), detail: "reloaded".into() };
+        let r = super::Ack {
+            ok: true,
+            pid: Some(7),
+            detail: "reloaded".into(),
+            removed: vec![],
+            missing: vec![],
+        };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"detail\":\"reloaded\""));
@@ -479,10 +542,10 @@ mod tests {
         let out = super::list_table(&rs.rules, std::path::Path::new("/var/lib/filewall/rules.toml"));
         let lines: Vec<&str> = out.lines().collect();
         // Header row with the expected columns.
-        assert!(lines[0].starts_with("IDX  ACTION"));
+        assert!(lines[0].starts_with("ID  ACTION"));
         assert!(lines[0].contains("OBJECT"));
-        // Data row: index 0, lowercased action/kind, the exe and object.
-        assert!(lines[1].starts_with("0    allow"));
+        // Data row: stable id 1, lowercased action/kind, the exe and object.
+        assert!(lines[1].starts_with("1   allow"));
         assert!(lines[1].contains("/usr/bin/ssh"));
         assert!(lines[1].contains("/home/u/.ssh"));
         assert!(lines[1].contains("tree"));
@@ -525,10 +588,12 @@ mod tests {
     }
 
     #[test]
-    fn remove_at_out_of_range_is_none() {
+    fn remove_ids_all_missing_removes_nothing() {
         let mut rs = Rules::default();
-        rs.push(rule("/usr/bin/a"));
-        assert!(remove_at(&mut rs, 5).is_none());
+        rs.push(rule("/usr/bin/a")); // id 1
+        let (removed, missing) = super::remove_ids(&mut rs, &[7, 8]);
+        assert!(removed.is_empty());
+        assert_eq!(missing, vec![7, 8]);
         assert_eq!(rs.rules.len(), 1);
     }
 }
