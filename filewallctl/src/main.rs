@@ -6,7 +6,10 @@
 //!   reload [pidfile]         Send SIGHUP to the running daemon.
 //!   status [pidfile]         Report whether the daemon is running.
 
+mod format;
+
 use filewall_rules::Rules;
+use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::path::{Path, PathBuf};
@@ -92,6 +95,28 @@ fn cmd_reload(pidfile: &Path) -> ExitCode {
     }
 }
 
+/// Daemon liveness derived from a signal-0 probe.
+#[derive(Debug, PartialEq, Eq)]
+enum Liveness {
+    Running,
+    Stale,
+    Unknown(Errno),
+}
+
+/// Classify a `kill(pid, 0)` result into daemon liveness.
+///
+/// `EPERM` means the process exists but we lack permission to signal it — the
+/// daemon runs as root while filewallctl runs unprivileged, so this is a live
+/// process, not a stale pid. Only `ESRCH` (no such process) is genuinely stale.
+fn classify_liveness(probe: Result<(), Errno>) -> Liveness {
+    match probe {
+        Ok(()) => Liveness::Running,
+        Err(Errno::EPERM) => Liveness::Running,
+        Err(Errno::ESRCH) => Liveness::Stale,
+        Err(e) => Liveness::Unknown(e),
+    }
+}
+
 fn cmd_status(pidfile: &Path) -> ExitCode {
     let text = match std::fs::read_to_string(pidfile) {
         Ok(t) => t,
@@ -108,13 +133,17 @@ fn cmd_status(pidfile: &Path) -> ExitCode {
         }
     };
     // Signal 0 probes liveness without delivering a signal.
-    match kill(Pid::from_raw(pid), None) {
-        Ok(()) => {
+    match classify_liveness(kill(Pid::from_raw(pid), None)) {
+        Liveness::Running => {
             println!("filewalld: running (pid {pid})");
             ExitCode::SUCCESS
         }
-        Err(_) => {
+        Liveness::Stale => {
             println!("filewalld: not running (stale pid {pid})");
+            ExitCode::FAILURE
+        }
+        Liveness::Unknown(e) => {
+            println!("filewalld: unknown (pid {pid}: {e})");
             ExitCode::FAILURE
         }
     }
@@ -172,8 +201,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pidfile, remove_at};
+    use super::{classify_liveness, parse_pidfile, remove_at, Liveness};
     use filewall_rules::{LearnedRule, ObjectKind, RuleAction, Rules};
+    use nix::errno::Errno;
     use std::path::PathBuf;
 
     fn rule(exe: &str) -> LearnedRule {
@@ -202,6 +232,30 @@ mod tests {
         assert_eq!(removed.exe, "/usr/bin/a");
         assert_eq!(rs.rules.len(), 1);
         assert_eq!(rs.rules[0].exe, "/usr/bin/b");
+    }
+
+    #[test]
+    fn eperm_means_running_not_stale() {
+        // Daemon owned by another user (root) — exists but unsignalable.
+        assert_eq!(classify_liveness(Err(Errno::EPERM)), Liveness::Running);
+    }
+
+    #[test]
+    fn esrch_means_stale() {
+        assert_eq!(classify_liveness(Err(Errno::ESRCH)), Liveness::Stale);
+    }
+
+    #[test]
+    fn ok_means_running() {
+        assert_eq!(classify_liveness(Ok(())), Liveness::Running);
+    }
+
+    #[test]
+    fn other_errno_is_unknown() {
+        assert_eq!(
+            classify_liveness(Err(Errno::EINVAL)),
+            Liveness::Unknown(Errno::EINVAL)
+        );
     }
 
     #[test]

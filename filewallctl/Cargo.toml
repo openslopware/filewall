@@ -9,5 +9,9 @@ name = "filewallctl"
 path = "src/main.rs"
 
 [dependencies]
+filewall-proto.workspace = true
 filewall-rules.workspace = true
 nix = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_norway = "0.9.42"
