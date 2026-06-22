@@ -4,6 +4,7 @@
 
 mod config;
 mod fanotify;
+mod markset;
 mod policy;
 mod server;
 mod treewatch;
