@@ -62,19 +62,7 @@ fn cmd_list(path: &Path, format: Format) -> ExitCode {
                 println!("No learned rules ({})", path.display());
                 return ExitCode::SUCCESS;
             }
-            println!("Learned rules ({}):", path.display());
-            for (i, r) in rules.rules.iter().enumerate() {
-                let cwd = r.cwd.as_deref().unwrap_or("-");
-                println!(
-                    "  [{i}] {:?} exe={} object={} kind={:?} cwd={} created_unix={}",
-                    r.action,
-                    r.exe,
-                    r.object.display(),
-                    r.object_kind,
-                    cwd,
-                    r.created_unix
-                );
-            }
+            print!("{}", list_table(&rules.rules, path));
             ExitCode::SUCCESS
         }
         _ => match render::emit(&rules.rules, format) {
@@ -261,6 +249,31 @@ fn dump_table(resp: &DumpResponse) -> String {
         &rows,
     );
     out.push_str(&format!("\n{} object(s) (pid {})\n", resp.objects.len(), resp.pid));
+    out
+}
+
+/// Render learned rules as an aligned table, mirroring `dump_table`'s layout.
+fn list_table(rules: &[filewall_rules::LearnedRule], path: &Path) -> String {
+    let rows: Vec<Vec<String>> = rules
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            vec![
+                i.to_string(),
+                format!("{:?}", r.action).to_lowercase(),
+                r.exe.clone(),
+                r.object.display().to_string(),
+                format!("{:?}", r.object_kind).to_lowercase(),
+                r.cwd.as_deref().unwrap_or("-").to_string(),
+                r.created_unix.to_string(),
+            ]
+        })
+        .collect();
+    let mut out = render::render_table(
+        &["IDX", "ACTION", "EXE", "OBJECT", "KIND", "CWD", "CREATED"],
+        &rows,
+    );
+    out.push_str(&format!("\n{} rule(s) ({})\n", rules.len(), path.display()));
     out
 }
 
@@ -457,6 +470,24 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"detail\":\"reloaded\""));
+    }
+
+    #[test]
+    fn list_table_renders_aligned_columns() {
+        let mut rs = Rules::default();
+        rs.push(rule("/usr/bin/ssh"));
+        let out = super::list_table(&rs.rules, std::path::Path::new("/var/lib/filewall/rules.toml"));
+        let lines: Vec<&str> = out.lines().collect();
+        // Header row with the expected columns.
+        assert!(lines[0].starts_with("IDX  ACTION"));
+        assert!(lines[0].contains("OBJECT"));
+        // Data row: index 0, lowercased action/kind, the exe and object.
+        assert!(lines[1].starts_with("0    allow"));
+        assert!(lines[1].contains("/usr/bin/ssh"));
+        assert!(lines[1].contains("/home/u/.ssh"));
+        assert!(lines[1].contains("tree"));
+        // Trailing summary line.
+        assert!(out.contains("1 rule(s) (/var/lib/filewall/rules.toml)"));
     }
 
     #[test]
