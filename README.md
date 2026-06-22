@@ -139,14 +139,12 @@ pidfile) and `/var/lib/filewall` (learned `rules.toml`) automatically.
 
 ## Configuration
 
-A watch on a directory marks the directory itself (with `FAN_EVENT_ON_CHILD`), so
-its files are covered with one kernel mark per directory rather than one per file —
-**newly-created files and atomically-renamed files are covered automatically**, and
-new sub-directories are live-marked as they appear. A watch on a single file marks
-that file directly.
+A directory watch marks the directory (with `FAN_EVENT_ON_CHILD`) — one kernel
+mark per directory, not per file — so newly-created and atomically-renamed files
+are covered automatically and new sub-directories are live-marked as they appear.
+A single-file watch marks that file directly.
 
-`config.toml` (see [`example_config.toml`](example_config.toml) for every option,
-fully commented):
+A minimal `config.toml`:
 
 ```toml
 default_action = "prompt"          # prompt | allow | deny (global; no per-watch default)
@@ -158,57 +156,33 @@ rules_path  = "/var/lib/filewall/rules.toml"   # where "Always" decisions persis
 path = "/home/you/.ssh"            # ~ expands to the daemon's $HOME; symlinked roots are canonicalized
 allow = ["/usr/bin/ssh", "/usr/bin/ssh-*", "/usr/bin/git"]
 exclude = ["**/Cache"]             # prune noisy subtrees; file globs auto-allow at access time
-patterns = []                      # empty = guard the whole tree; see below to scope by filename
+patterns = []                      # empty = whole tree; e.g. ["*_history"] scopes to a class of files
 learn_object = "file"              # "file" | "tree" — scope of an "Always" rule
 learn_match  = ["exe"]             # add "cwd" to pin the working directory too
 ```
 
-Glob semantics: `*` does not cross `/`; `**` does.
-
-**Scoping a watch to a class of files (`patterns`).** To guard, say, only the
-shell-history files in an otherwise-uninteresting directory without listing each
-one, set `patterns` (globs matched *relative to* `path`). Empty (the default)
-guards the whole tree. The pattern's shape decides how much gets marked:
-
-```toml
-[[watch]]
-path = "/home/you"                 # $HOME holds thousands of unrelated files
-allow = []
-patterns = [".zsh_history", ".bash_history", "*_history"]   # shallow → ONE mark on ~
-learn_object = "file"
-```
-
-- A **shallow** pattern (`*_history`, no `/` or `**`) matches only files *directly*
-  in the dir, so filewalld marks **just that one directory** — one fanotify mark,
-  and robust to the atomic temp+rename that zsh/bash use to rewrite history (a
-  single-file mark would be orphaned by the rename; the directory mark is not).
-- A **deep** pattern (`**/*_history`, or anything containing `/`) matches at any
-  depth and therefore marks the **entire subtree** (one mark + one inotify watch per
-  sub-directory). filewalld logs a warning at load for each deep pattern — a careless
-  `**` can exhaust `fs.fanotify.max_user_marks` / `fs.inotify.max_user_watches` and
-  leave *other* watches unmarked. `exclude` still prunes noisy subtrees from the walk.
-
-Children matching none of the `patterns` are auto-allowed at access time (the
-mirror of `exclude`).
+Globs: `*` does not cross `/`, `**` does. See
+**[`example_config.toml`](example_config.toml)** for every option and seven
+worked examples (allowlists, single-file lockdown, tree-mode learning, cwd
+pinning, and `patterns`-based scoping).
 
 > **`~` resolves to the *daemon's* home.** As a system service `filewalld` runs as
 > **root**, so `~` expands to `/root`, not your login home. To guard a user's files
 > under the packaged service, write the **absolute** path (e.g. `/home/alice/.ssh`).
-> The shipped `/etc/filewall/config.toml` is a commented template with no active
-> watches, so the daemon starts clean and guards nothing until you opt in.
+> The shipped `/etc/filewall/config.toml` ships with no active watches, so the
+> daemon starts clean and guards nothing until you opt in.
 
-Run the daemon (dev): `sudo ./target/release/filewalld /path/to/config.toml`
-Run the UI (dev):     `./target/release/filewall-ui-iced`
+Running directly (development):
 
-> The native UI needs a graphical session but no external dialog tool, and follows
-> the desktop's light/dark preference (read from xdg-desktop-portal's
-> `org.freedesktop.appearance` `color-scheme`). A broad (whole-tree) "Always allow"
-> grant is shown with a prominent red warning so it is visually distinct from a
-> single-file one. Pass `--demo` to preview the prompt without a running daemon. The
-> yad variant (`./target/release/filewall-ui`) is an alternative that instead needs
-> **`yad`** in the session.
+```sh
+sudo ./target/release/filewalld /path/to/config.toml   # daemon
+./target/release/filewall-ui-iced                       # prompt UI (--demo previews without a daemon)
+```
 
-For a packaged install that runs both as managed services, see
+The native UI follows the desktop's light/dark preference (via xdg-desktop-portal's
+`color-scheme`) and shows whole-tree "Always allow" grants with a prominent red
+warning. The `filewall-ui` (yad) variant is an alternative that needs **`yad`** in
+the session. For a packaged install that runs both as managed services, see
 [Installation](#installation).
 
 ## Managing learned rules
@@ -261,28 +235,10 @@ Columns:
 
 ## Deferred (post-MVP)
 
-Core daemon/UI:
-- mount/filesystem-wide marking.
-- multi-user / per-user sockets and `SO_PEERCRED`. The daemon holds a **single** UI
-  link over one global `0o666` socket, so it serves **one interactive user at a
-  time** — fast-user-switching / multi-seat is not supported.
-- privilege drop after init (the daemon stays root for its lifetime).
-- `notify-send` UI variant (the UI ships as a native `filewall-ui-iced` and a
-  `yad`-based `filewall-ui`; a lightweight `notify-send` variant is still deferred).
-
-Packaging (recommended follow-ups identified while adding the systemd/PKGBUILD support):
-- **Tighten the daemon unit's sandbox.** `packaging/systemd/filewalld.service`
-  intentionally ships with only seccomp/capability hardening; mount-namespace
-  directives are omitted because they can blind a daemon that must see the whole
-  filesystem and every process's `/proc`. Worth testing, one at a time, whether
-  `ProtectSystem=strict` (read-only fs — the daemon only *reads* watched inodes) can
-  be enabled without breaking fanotify. `ProtectHome`/`ProtectProc` are expected to
-  break it and must stay off.
-- **A reproducible PKGBUILD variant.** The shipped `PKGBUILD` builds the local
-  working tree. Add a tagged-release (tarball) or VCS (`-git`) variant for
-  chroot-clean, reproducible builds once the project is tagged.
-- **Commit `Cargo.lock`.** It is currently git-ignored; committing it is a
-  prerequisite for reproducible packaged builds (the `PKGBUILD` builds with
-  `--locked`).
-- **Ship man pages.** The units reference no `Documentation=` because none exist
-  yet; add `man` pages for `filewalld`/`filewall-ui`/`filewallctl` and wire them up.
+- **Single interactive user.** The daemon holds one UI link over a global `0o666`
+  socket, so it serves **one user at a time** — fast-user-switching / multi-seat is
+  not supported (no per-user sockets / `SO_PEERCRED` yet).
+- mount/filesystem-wide marking; privilege drop after init (the daemon stays root
+  for its lifetime); a lightweight `notify-send` UI variant.
+- Packaging follow-ups: a reproducible (tagged/VCS) `PKGBUILD` variant, committing
+  `Cargo.lock`, man pages, and testing a tighter systemd sandbox.

@@ -35,6 +35,10 @@ prompt_timeout_seconds = 120
 # Matches the packaged unit's RuntimeDirectory=filewall (→ /run/filewall).
 socket_path = "/run/filewall/prompt.sock"
 
+# Control socket `filewallctl` queries (e.g. `dump`, `status`). Kept separate
+# from the prompt socket so the fail-closed prompt path is never touched.
+control_socket_path = "/run/filewall/control.sock"
+
 # Where "Always allow/deny" decisions are persisted (learned rules). The daemon
 # reloads this on the same trigger as the config. Matches the packaged unit's
 # StateDirectory=filewall (→ /var/lib/filewall).
@@ -64,6 +68,13 @@ rules_path = "/var/lib/filewall/rules.toml"
 #                   (the parent directory's mark fires for every child, so the daemon
 #                   filters these out itself). Use it to silence known-noisy files.
 #                 Same glob rules as `allow`.
+#
+#   patterns      Globs (matched RELATIVE to `path`) selecting which children are
+#                 in scope; a child matching none is auto-allowed. Empty (default)
+#                 = the whole tree. A SHALLOW pattern (`*_history`, no `/` or `**`)
+#                 marks just this one directory; a DEEP pattern (`**/...` or any
+#                 with `/`) marks the entire subtree (warned at load — a careless
+#                 `**` can exhaust the kernel mark/watch limits). See Approach 6.
 #
 #   learn_object  What an "Always" decision records: "file" (this exact path,
 #                 default) or "tree" (the whole watch root). Use "tree" for
@@ -132,4 +143,18 @@ rules_path = "/var/lib/filewall/rules.toml"
 #allow = ["/usr/bin/gpg", "/usr/bin/gpg-agent"]
 #exclude = ["**/*.lock", "**/random_seed"]
 #learn_object = "tree"
+#learn_match = ["exe"]
+
+
+# Approach 6 — Guard a CLASS of files in a busy dir with `patterns` (shallow).
+# Shell-history files live directly in $HOME among thousands of unrelated files.
+# A shallow pattern marks ONLY $HOME (one fanotify mark) and prompts solely for
+# the history-shaped files; every other immediate child is auto-allowed. It is
+# also robust to the atomic temp+rename zsh/bash use (a single-file mark would be
+# orphaned by the rename; the directory mark is not).
+#[[watch]]
+#path = "/home/USER"
+#allow = []
+#patterns = [".zsh_history", ".bash_history", ".python_history", "*_history"]
+#learn_object = "file"
 #learn_match = ["exe"]
