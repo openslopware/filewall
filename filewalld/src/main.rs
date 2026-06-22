@@ -3,6 +3,7 @@
 //! `filewall-ui` helper whether to allow the access.
 
 mod config;
+mod control;
 mod fanotify;
 mod markset;
 mod policy;
@@ -11,17 +12,18 @@ mod treewatch;
 mod watcher;
 
 use config::Config;
+use control::ControlServer;
 use fanotify::Fanotify;
 use filewall_proto::{Decision, ObjKind, PromptRequest};
 use filewall_rules::{RuleAction, Rules};
 use log::{debug, info, warn};
-use markset::{MarkEntry, MarkSet};
+use markset::{build_dump, MarkEntry, MarkSet};
 use policy::{combine, Outcome, Policy, WatchPolicy};
 use server::{is_disconnect, UiLink, UiServer};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const DEFAULT_CONFIG: &str = "/etc/filewall/config.toml";
 const PIDFILE: &str = "/run/filewall/filewalld.pid";
@@ -116,6 +118,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server = UiServer::bind(&cfg.socket_path, timeout)?;
     info!("listening on {}", cfg.socket_path.display());
 
+    // Second socket for filewallctl queries (dump). Separate from the prompt
+    // socket so the fail-closed prompt path is untouched. A bind failure here is
+    // non-fatal: protection still works, only `filewallctl dump` is unavailable.
+    let control = match ControlServer::bind(&cfg.control_socket_path) {
+        Ok(c) => {
+            info!("control socket on {}", cfg.control_socket_path.display());
+            Some(c)
+        }
+        Err(e) => {
+            warn!("could not bind control socket {}: {e}", cfg.control_socket_path.display());
+            None
+        }
+    };
+
     // Mark every watched root (files directly; directories via ON_CHILD).
     let mut marks = MarkSet::new();
     let marked = mark_all(&fan, &policy, &mut marks);
@@ -131,7 +147,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop(
         &fan, &mut policy, &mut rules, &rules_path, &config_path, &server, &mut ui,
-        &mut treewatch, own_pid, ui_timeout_ms, &mut marks,
+        &mut treewatch, own_pid, ui_timeout_ms, &mut marks, control.as_ref(),
     )
 }
 
@@ -250,15 +266,18 @@ fn event_loop(
     own_pid: u32,
     ui_timeout_ms: u32,
     marks: &mut MarkSet,
+    control: Option<&ControlServer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // Poll the fanotify fd and the treewatch inotify fd together. A bounded
         // timeout lets a pending RELOAD (set by the config/rules watcher thread or a
         // SIGHUP, neither of which can interrupt a blocking read) be acted on
         // promptly.
+        let control_fd = control.map(|c| c.raw_fd()).unwrap_or(-1);
         let mut fds = [
             libc::pollfd { fd: fan.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: treewatch.raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: control_fd, events: libc::POLLIN, revents: 0 },
         ];
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, RELOAD_POLL_MS) };
         let events = if rc < 0 {
@@ -277,6 +296,21 @@ fn event_loop(
             // are likelier covered before we process the fanotify backlog.
             if fds[1].revents & libc::POLLIN != 0 {
                 treewatch.on_ready(fan, policy, marks);
+            }
+            // Answer a filewallctl query. `treewatch.on_ready` (mutable borrow) has
+            // returned, so the closure can borrow `treewatch`/`marks` immutably.
+            if fds[2].revents & libc::POLLIN != 0 {
+                if let Some(ctl) = control {
+                    let own = own_pid;
+                    ctl.handle_ready(|| filewall_proto::DumpResponse {
+                        pid: own,
+                        generated_unix: SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                        objects: build_dump(marks, |p| treewatch.is_watching(p)),
+                    });
+                }
             }
             if fds[0].revents & libc::POLLIN != 0 {
                 fan.read_ready()?
