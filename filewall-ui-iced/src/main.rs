@@ -13,7 +13,8 @@ mod worker;
 
 use filewall_proto::{Decision, PromptRequest};
 use iced::futures::{SinkExt, Stream, StreamExt};
-use iced::widget::{button, column, container, row, text, Space};
+use iced::widget::text::Wrapping;
+use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{event, keyboard, stream, time, window, Element, Font, Length, Subscription, Task};
 use model::{PromptView, Scope};
 use std::path::PathBuf;
@@ -108,12 +109,20 @@ fn home_dir() -> String {
 fn window_settings() -> window::Settings {
     window::Settings {
         size: iced::Size::new(580.0, 400.0),
+        // Fits the pinned header, scope warning, countdown and the 4-button row.
+        min_size: Some(iced::Size::new(580.0, 320.0)),
         position: window::Position::Centered,
-        resizable: false,
+        resizable: true,
         level: window::Level::AlwaysOnTop,
         // We intercept the close button ourselves to fail closed; don't let the
         // window vanish without sending a decision.
         exit_on_close_request: false,
+        // Tiling compositors tile a resizable window like any other; a window
+        // rule matching this app-id is needed to float it (see README).
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "filewall-ui-iced".into(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -242,9 +251,13 @@ impl App {
             .size(18)
             .color(danger);
 
+        // Untrusted fields may contain no spaces; word-only wrapping would clip
+        // their tail off the right edge instead of wrapping it.
+        let field = |s: String| text(s).wrapping(Wrapping::WordOrGlyph);
+
         let wants = column![
-            text(format!("{} wants to open:", v.proc_name)).font(bold),
-            text(v.path.clone()).size(15),
+            field(format!("{} wants to open:", v.proc_name)).font(bold),
+            field(v.path.clone()).size(15),
         ]
         .spacing(2);
 
@@ -254,8 +267,8 @@ impl App {
                 text("\"Always allow\" GRANTS ACCESS TO ALL FILES")
                     .font(bold)
                     .color(danger),
-                text(format!(
-                    "    under {} \u{2014} every subfolder, not just the file above.",
+                field(format!(
+                    "    under {} \u{2014} every subfolder, not just the requested file.",
                     v.object
                 ))
                 .color(danger),
@@ -264,7 +277,7 @@ impl App {
             .into(),
             Scope::File => column![
                 text("\"Always allow\" remembers only this one file:"),
-                text(format!("    {}", v.object)),
+                field(format!("    {}", v.object)),
             ]
             .spacing(2)
             .into(),
@@ -272,14 +285,14 @@ impl App {
 
         let mut tied = column![
             text("Rule is tied to this program:"),
-            text(format!("    {}", v.exe)),
+            field(format!("    {}", v.exe)),
         ]
         .spacing(2);
         if v.cwd_pinned {
-            tied = tied.push(text(format!("\u{2026}and only while it runs from {}", v.cwd)));
+            tied = tied.push(field(format!("\u{2026}and only while it runs from {}", v.cwd)));
         }
 
-        let meta = text(format!("PID {} \u{00B7} cmd: {}", v.pid, v.cmdline)).size(12);
+        let meta = field(format!("PID {} \u{00B7} cmd: {}", v.pid, v.cmdline)).size(12);
 
         let countdown = text(format!("auto-deny in {}s", p.remaining_s)).size(12);
 
@@ -304,16 +317,17 @@ impl App {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        let content = column![
-            header,
-            wants,
-            scope,
-            tied,
-            meta,
-            Space::with_height(4),
-            countdown,
-            buttons,
-        ]
+        // Only the details scroll: the scope warning, countdown and buttons stay
+        // visible however long the untrusted fields are.
+        let details = scrollable(
+            column![wants, tied, meta]
+                .spacing(14)
+                .padding(iced::Padding::ZERO.right(14))
+                .width(Length::Fill),
+        )
+        .height(Length::Fill);
+
+        let content = column![header, scope, details, countdown, buttons]
         .spacing(14)
         .padding(20);
 

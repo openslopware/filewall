@@ -142,6 +142,22 @@ fn connect_forever(path: &Path) -> UnixStream {
 pub fn run_demo(req_tx: UnboundedSender<PromptRequest>, dec_rx: Receiver<Decision>) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/demo".into());
     let samples = [
+        // Overlong, space-less fields: exercises wrapping and the details scroll.
+        PromptRequest {
+            pid: 4242,
+            exe: format!("{home}/.local/share/toolchains/x86_64-unknown-linux-gnu/bin/very-long-helper-binary-name"),
+            cmdline: format!(
+                "very-long-helper-binary-name --config={home}/.config/app/{} {}",
+                "nested/".repeat(30),
+                "--flag=value ".repeat(25)
+            ),
+            cwd: format!("{home}/projects/foo"),
+            path: format!("{home}/.config/{}credentials.json", "deeply-nested-directory/".repeat(8)),
+            always_object: format!("{home}/.config"),
+            always_tree: true,
+            always_cwd_pinned: true,
+            ui_timeout_ms: 60_000,
+        },
         PromptRequest {
             pid: 84321,
             exe: "/usr/bin/node".into(),

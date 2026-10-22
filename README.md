@@ -133,6 +133,13 @@ pidfile) and `/var/lib/filewall` (learned `rules.toml`) automatically.
 > `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS`.
 > A missing display degrades safely — the UI fails closed (deny).
 
+> **Tiling compositors:** the native prompt is a resizable window with app-id
+> `filewall-ui-iced`, so tiling WMs tile it like any other window — possibly
+> off-screen. Float it with a window rule, e.g. niri:
+> `window-rule { match app-id="filewall-ui-iced"; open-floating true; }` ·
+> sway: `for_window [app_id="filewall-ui-iced"] floating enable` ·
+> Hyprland: `windowrulev2 = float, class:^(filewall-ui-iced)$`.
+
 > **Large trees:** if `journalctl -u filewalld` shows mark/watch-limit warnings,
 > raise `fs.fanotify.max_user_marks` and `fs.inotify.max_user_watches` via
 > `/etc/sysctl.d/` (the package's post-install message shows the exact commands).

@@ -32,7 +32,7 @@ pub struct PromptView {
 }
 
 /// Cap a field's display length so a hostile, very long `cmdline`/`path` cannot
-/// blow up the window layout and push the buttons off-screen.
+/// turn the details area into an endless scroll.
 const MAX_FIELD: usize = 400;
 
 fn cap(s: &str) -> String {
